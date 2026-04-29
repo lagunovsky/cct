@@ -430,7 +430,7 @@ fn snippet_window(text: &str, match_idx: usize, match_len: usize, context_chars:
         sanitized.push(ch);
         prev_space = ch == ' ';
     }
-    let mut result = sanitized.trim().to_string();
+    let mut result = collapse_long_spaces(sanitized.trim());
 
     if truncated_left {
         if let Some(sp_byte) = result.find(' ') {
@@ -461,6 +461,38 @@ fn snippet_window(text: &str, match_idx: usize, match_len: usize, context_chars:
         result = format!("{result}{GRAY} ⋯{RESET}");
     }
     result
+}
+
+/// Replace runs of 3+ spaces (terminal padding, table layout, etc.) with a
+/// single dim ellipsis so snippets stay readable when the original text is
+/// heavily indented.
+fn collapse_long_spaces(s: &str) -> String {
+    const THRESHOLD: usize = 3;
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != ' ' {
+            out.push(ch);
+            continue;
+        }
+        let mut run = 1;
+        while chars.peek() == Some(&' ') {
+            chars.next();
+            run += 1;
+        }
+        if run >= THRESHOLD {
+            out.push(' ');
+            out.push_str(GRAY);
+            out.push('⋯');
+            out.push_str(RESET);
+            out.push(' ');
+        } else {
+            for _ in 0..run {
+                out.push(' ');
+            }
+        }
+    }
+    out
 }
 
 fn search_one_index(
