@@ -94,12 +94,23 @@ pub fn run_update(
         mut catalog_by_path,
         scanned,
     } = plan;
+    let start = Instant::now();
 
     let enabled_names = enabled
         .iter()
         .map(|k| k.as_str())
         .collect::<Vec<_>>()
         .join(",");
+    let active_indexes = affected_indexes(&enabled, &catalog_by_path, &scanned);
+    let active_names = if active_indexes.is_empty() {
+        "none".to_string()
+    } else {
+        active_indexes
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     if verbose {
         eprintln!(
             "Updating {} from {} [{}]",
@@ -107,11 +118,13 @@ pub fn run_update(
             source.display(),
             enabled_names,
         );
-        print_writer_config(config, enabled.len());
+        eprintln!("  active writers [{active_names}]");
+        if !active_indexes.is_empty() {
+            print_writer_config(config, active_indexes.len());
+        }
     }
 
-    let mut targets = open_existing_targets(index_dir, &enabled, config)?;
-    let start = Instant::now();
+    let mut targets = open_existing_targets(index_dir, &active_indexes, config)?;
     let mut stats = UpdateStats::default();
     let mut next_file_id = catalog_by_path
         .values()
@@ -185,33 +198,39 @@ pub fn run_update(
         );
     }
 
-    for target in &mut targets {
-        let phase = Instant::now();
-        if verbose {
-            eprintln!("Committing {}...", target.kind.as_str());
+    let index_dirty =
+        stats.added > 0 || stats.reindexed > 0 || stats.deleted > 0 || stats.indexed_chunks > 0;
+    if index_dirty {
+        for target in &mut targets {
+            let phase = Instant::now();
+            if verbose {
+                eprintln!("Committing {}...", target.kind.as_str());
+            }
+            target.writer.commit()?;
+            if verbose {
+                eprintln!(
+                    "Committed {} in {:?}",
+                    target.kind.as_str(),
+                    phase.elapsed()
+                );
+            }
         }
-        target.writer.commit()?;
-        if verbose {
-            eprintln!(
-                "Committed {} in {:?}",
-                target.kind.as_str(),
-                phase.elapsed()
-            );
+        for target in targets {
+            let phase = Instant::now();
+            if verbose {
+                eprintln!("Waiting merges for {}...", target.kind.as_str());
+            }
+            target.writer.wait_merging_threads()?;
+            if verbose {
+                eprintln!(
+                    "Merges done for {} in {:?}",
+                    target.kind.as_str(),
+                    phase.elapsed()
+                );
+            }
         }
-    }
-    for target in targets {
-        let phase = Instant::now();
-        if verbose {
-            eprintln!("Waiting merges for {}...", target.kind.as_str());
-        }
-        target.writer.wait_merging_threads()?;
-        if verbose {
-            eprintln!(
-                "Merges done for {} in {:?}",
-                target.kind.as_str(),
-                phase.elapsed()
-            );
-        }
+    } else if verbose {
+        eprintln!("No index documents changed; skipping commit.");
     }
 
     let _catalog_path = write_catalog(index_dir, &new_catalog)?;
@@ -255,4 +274,105 @@ fn is_append_update(entry: &CatalogEntry, file: &DiscoveredFile) -> bool {
         && file.size >= entry.size
         && entry.indexed_offset <= file.size
         && file.size > entry.indexed_offset
+}
+
+fn affected_indexes(
+    enabled: &BTreeSet<IndexKind>,
+    catalog_by_path: &BTreeMap<PathBuf, CatalogEntry>,
+    scanned: &BTreeMap<PathBuf, DiscoveredFile>,
+) -> BTreeSet<IndexKind> {
+    let mut content_changed = false;
+    let mut path_changed = false;
+
+    for (path, entry) in catalog_by_path {
+        let Some(file) = scanned.get(path) else {
+            content_changed = true;
+            path_changed = true;
+            continue;
+        };
+        if file.size == entry.size && file.mtime_ms == entry.mtime_ms {
+            continue;
+        }
+        if is_append_update(entry, file) {
+            content_changed = true;
+            continue;
+        }
+        content_changed = true;
+        path_changed = true;
+    }
+
+    if scanned
+        .keys()
+        .any(|path| !catalog_by_path.contains_key(path))
+    {
+        content_changed = true;
+        path_changed = true;
+    }
+
+    let mut affected = BTreeSet::new();
+    if content_changed {
+        for kind in [IndexKind::Word, IndexKind::Trigram] {
+            if enabled.contains(&kind) {
+                affected.insert(kind);
+            }
+        }
+    }
+    if path_changed && enabled.contains(&IndexKind::Path) {
+        affected.insert(IndexKind::Path);
+    }
+    affected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs_scan::FileKind;
+
+    fn catalog_entry(path: &str, size: u64, mtime_ms: u128) -> CatalogEntry {
+        CatalogEntry {
+            file_id: 7,
+            kind: FileKind::SessionJsonl.as_str().to_string(),
+            size,
+            mtime_ms,
+            indexed_offset: size,
+            next_chunk_id: 1,
+            path: PathBuf::from(path),
+        }
+    }
+
+    fn discovered_file(path: &str, size: u64, mtime_ms: u128) -> DiscoveredFile {
+        DiscoveredFile {
+            path: PathBuf::from(path),
+            kind: FileKind::SessionJsonl,
+            size,
+            mtime_ms,
+        }
+    }
+
+    #[test]
+    fn append_update_only_affects_content_indexes() {
+        let enabled = IndexKind::all();
+        let path = PathBuf::from("/tmp/session.jsonl");
+        let mut catalog = BTreeMap::new();
+        catalog.insert(path.clone(), catalog_entry("/tmp/session.jsonl", 10, 1));
+        let mut scanned = BTreeMap::new();
+        scanned.insert(path, discovered_file("/tmp/session.jsonl", 20, 2));
+
+        let affected = affected_indexes(&enabled, &catalog, &scanned);
+        assert!(affected.contains(&IndexKind::Word));
+        assert!(affected.contains(&IndexKind::Trigram));
+        assert!(!affected.contains(&IndexKind::Path));
+    }
+
+    #[test]
+    fn new_or_rewritten_file_affects_all_enabled_indexes() {
+        let enabled = IndexKind::all();
+        let path = PathBuf::from("/tmp/session.jsonl");
+        let mut catalog = BTreeMap::new();
+        catalog.insert(path.clone(), catalog_entry("/tmp/session.jsonl", 20, 1));
+        let mut scanned = BTreeMap::new();
+        scanned.insert(path, discovered_file("/tmp/session.jsonl", 10, 2));
+
+        assert_eq!(affected_indexes(&enabled, &catalog, &scanned), enabled);
+    }
 }
