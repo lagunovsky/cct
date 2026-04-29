@@ -39,76 +39,111 @@ pub struct DiscoveredFile {
 ///   `<project>/<session>/tool-results/*.{txt,json,jsonl,md,log,csv,tsv,html,htm,xml}`
 ///
 /// Returns files sorted by path for deterministic file_id assignment.
+/// Stats inside each project are run in parallel — that's where most of the
+/// scan time goes on a 10k+ file corpus.
 pub fn collect_cct_layout(projects_dir: &Path) -> Result<Vec<DiscoveredFile>> {
-    let mut out = Vec::new();
     if !projects_dir.is_dir() {
-        return Ok(out);
+        return Ok(Vec::new());
     }
 
-    for project_entry in fs::read_dir(projects_dir)
+    let mut project_dirs: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(projects_dir)
         .with_context(|| format!("read dir {}", projects_dir.display()))?
     {
-        let project_entry = project_entry?;
-        if !project_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let project_path = project_entry.path();
-        for entry in fs::read_dir(&project_path)
-            .with_context(|| format!("read dir {}", project_path.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            let ty = entry.file_type()?;
-            if ty.is_file() {
-                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                    push_file(&mut out, path, FileKind::SessionJsonl)?;
-                }
-                continue;
-            }
-            if !ty.is_dir() {
-                continue;
-            }
-
-            collect_session_subdirs(&path, &mut out)?;
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            project_dirs.push(entry.path());
         }
     }
+
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(8)
+        .max(1);
+
+    let mut out = if workers == 1 || project_dirs.len() <= 1 {
+        let mut buf = Vec::new();
+        for dir in &project_dirs {
+            collect_project(dir, &mut buf);
+        }
+        buf
+    } else {
+        let chunk_size = project_dirs.len().div_ceil(workers).max(1);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = project_dirs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        let mut local = Vec::new();
+                        for dir in chunk {
+                            collect_project(dir, &mut local);
+                        }
+                        local
+                    })
+                })
+                .collect();
+            let mut all = Vec::new();
+            for h in handles {
+                all.extend(h.join().expect("scan worker panicked"));
+            }
+            all
+        })
+    };
+
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
 
-fn collect_session_subdirs(session_dir: &Path, out: &mut Vec<DiscoveredFile>) -> Result<()> {
-    let subagents = session_dir.join("subagents");
-    if let Ok(entries) = fs::read_dir(&subagents) {
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+fn collect_project(project_path: &Path, out: &mut Vec<DiscoveredFile>) {
+    let Ok(entries) = fs::read_dir(project_path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ty) = entry.file_type() else { continue };
+        if ty.is_file() {
+            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                push_file(out, path, FileKind::SessionJsonl);
+            }
+        } else if ty.is_dir() {
+            collect_session_subdirs(&path, out);
+        }
+    }
+}
+
+fn collect_session_subdirs(session_dir: &Path, out: &mut Vec<DiscoveredFile>) {
+    if let Ok(entries) = fs::read_dir(session_dir.join("subagents")) {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_file() {
                 continue;
             }
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                push_file(out, p, FileKind::SubagentJsonl)?;
+                push_file(out, p, FileKind::SubagentJsonl);
             }
         }
     }
 
-    let tool_results = session_dir.join("tool-results");
-    if let Ok(entries) = fs::read_dir(&tool_results) {
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+    if let Ok(entries) = fs::read_dir(session_dir.join("tool-results")) {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_file() {
                 continue;
             }
             let p = entry.path();
             if is_text_like_tool_result(&p) {
-                push_file(out, p, FileKind::ToolResult)?;
+                push_file(out, p, FileKind::ToolResult);
             }
         }
     }
-    Ok(())
 }
 
-fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) -> Result<()> {
-    let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) {
+    let Ok(meta) = fs::metadata(&path) else {
+        return;
+    };
     let mtime_ms = meta
         .modified()
         .ok()
@@ -121,7 +156,6 @@ fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) -> Re
         size: meta.len(),
         mtime_ms,
     });
-    Ok(())
 }
 
 pub fn is_text_like_tool_result(path: &Path) -> bool {
