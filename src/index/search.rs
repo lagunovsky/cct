@@ -596,8 +596,9 @@ pub fn print_session_header(s: &SessionResult, prompts: u32, tools: u32, bytes: 
     );
 }
 
-/// Print snippets respecting the three-tier fallback used by the Go tool.
-pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool) {
+/// Three-tier fallback used by the Go tool: prompts/answers first, then any
+/// "other" tagged snippets, finally agent/hook (only when verbose).
+pub fn select_visible_snippets<'a>(snippets: &'a [Snippet], verbose: bool) -> Vec<&'a Snippet> {
     let mut primary = Vec::new();
     let mut secondary = Vec::new();
     let mut tertiary = Vec::new();
@@ -608,21 +609,24 @@ pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool) {
             _ => secondary.push(s),
         }
     }
-
-    let show: Vec<&Snippet> = if verbose {
+    if verbose {
         primary
-            .iter()
-            .chain(secondary.iter())
-            .chain(tertiary.iter())
-            .copied()
+            .into_iter()
+            .chain(secondary)
+            .chain(tertiary)
             .collect()
     } else if !primary.is_empty() {
-        primary.iter().copied().collect()
+        primary
     } else if !secondary.is_empty() {
-        secondary.iter().copied().collect()
+        secondary
     } else {
-        tertiary.iter().copied().collect()
-    };
+        tertiary
+    }
+}
+
+/// Print snippets respecting the three-tier fallback used by the Go tool.
+pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool) {
+    let show = select_visible_snippets(snippets, verbose);
 
     for (j, s) in show.iter().enumerate() {
         if j >= 5 {

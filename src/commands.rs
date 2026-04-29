@@ -278,6 +278,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     sp.stop();
 
     let render_start = Instant::now();
+    sessions.retain(|s| !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty());
     let total = sessions.len();
     let to_show = sessions.len().min(args.limit);
     if to_show == 0 {
