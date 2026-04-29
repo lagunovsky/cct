@@ -361,8 +361,10 @@ fn format_duration(duration: Duration) -> String {
 fn print_search_header(query: &str, args: &cli::SearchCmd, label: Option<&str>) {
     if args.global || label.is_none() {
         println!("{BOLD}Searching for:{RESET} {query}  {DIM}(global){RESET}");
-    } else if let Some(label) = label {
-        println!("{BOLD}Searching for:{RESET} {query}  {DIM}in {label}{RESET}");
+    } else if args.project.is_some() {
+        if let Some(label) = label {
+            println!("{BOLD}Searching for:{RESET} {query}  {DIM}in {label}{RESET}");
+        }
     }
 }
 
