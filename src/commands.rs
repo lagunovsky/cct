@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -201,11 +201,14 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     print_search_header(&query, &args, project_label.as_deref());
 
     let verbose_index = args.verbose >= 2;
+    let mut scan_elapsed = Duration::ZERO;
+    let mut update_elapsed = Duration::ZERO;
     if !args.no_update {
         if !index_dir.exists() {
             eprintln!("{DIM}Building initial index — this may take a while...{RESET}");
             let config = WriterConfig::for_full_reindex();
             let files = collect_cct_layout(&source)?;
+            let upd_start = Instant::now();
             run_full_reindex(
                 &source,
                 &index_dir,
@@ -214,11 +217,16 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
                 config,
                 verbose_index,
             )?;
+            update_elapsed = upd_start.elapsed();
         } else {
+            let scan_start = Instant::now();
             let sp = Spinner::start("scanning sessions...");
             let files = collect_cct_layout(&source)?;
             let plan = build_plan(&index_dir, Some(source.clone()), files)?;
-            if needs_update(&plan) {
+            let need = needs_update(&plan);
+            scan_elapsed = scan_start.elapsed();
+            if need {
+                let upd_start = Instant::now();
                 if verbose_index {
                     sp.stop();
                     run_update(
@@ -237,6 +245,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
                     )?;
                     sp.stop();
                 }
+                update_elapsed = upd_start.elapsed();
             } else {
                 sp.stop();
             }
@@ -258,7 +267,9 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         context_chars: args.context,
         project_prefix: project_prefix.clone(),
     };
+    let search_start = Instant::now();
     let mut sessions = search::run_search(&index_dir, &opts)?;
+    let search_elapsed = search_start.elapsed();
     sp.stop();
 
     let total = sessions.len();
@@ -285,8 +296,21 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     }
 
     let elapsed = start.elapsed();
+    let mut parts: Vec<String> = Vec::new();
+    if scan_elapsed.as_millis() >= 5 {
+        parts.push(format!("scan {scan_elapsed:?}"));
+    }
+    if update_elapsed.as_millis() >= 5 {
+        parts.push(format!("update {update_elapsed:?}"));
+    }
+    parts.push(format!("search {search_elapsed:?}"));
+    let breakdown = if parts.len() > 1 {
+        format!(" ({DIM}{}{RESET})", parts.join(" + "))
+    } else {
+        String::new()
+    };
     println!(
-        "\n{DIM}{count} sessions in {elapsed:?}{RESET}",
+        "\n{DIM}{count} sessions in {elapsed:?}{RESET}{breakdown}",
         count = to_show,
     );
     Ok(())
