@@ -20,29 +20,35 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Recent sessions in current project (default).
+    #[command(visible_alias ="r")]
     Recent(RecentCmd),
 
     /// Full-text search across Claude Code sessions.
-    #[command(alias = "s")]
+    #[command(visible_alias ="s")]
     Search(SearchCmd),
 
     /// Rebuild the search index from scratch.
+    #[command(visible_alias ="ri")]
     Reindex(ReindexCmd),
 
     /// Apply incremental updates (add new files, append-tail jsonl, drop removed).
+    #[command(visible_alias ="u")]
     Update(UpdateCmd),
 
     /// Compact existing segments to reduce size and segment count.
+    #[command(visible_alias ="c")]
     Compact(CompactCmd),
 
     /// Migrate a project's sessions when its directory is renamed/moved.
+    #[command(visible_alias ="rn")]
     Rename(RenameCmd),
 
     /// Move specific sessions between projects.
-    #[command(alias = "mv")]
+    #[command(visible_alias ="mv")]
     Move(MoveCmd),
 
     /// Manage launchd background indexing (macOS).
+    #[command(visible_alias ="d")]
     Daemon(DaemonCmd),
 }
 
