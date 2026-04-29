@@ -100,6 +100,19 @@ impl Fixture {
             limit: 20,
             context_chars: 80,
             project_prefix: None,
+            fuzzy: false,
+        };
+        run_search(&self.index_dir, &opts).unwrap_or_default()
+    }
+
+    fn search_fuzzy(&self, query: &str) -> Vec<SessionResult> {
+        let opts = SearchOptions {
+            query: query.to_string(),
+            mode: SearchMode::Auto,
+            limit: 20,
+            context_chars: 80,
+            project_prefix: None,
+            fuzzy: true,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -623,12 +636,56 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
         limit: 20,
         context_chars: 80,
         project_prefix: Some(fx.project_dir.clone()),
+        fuzzy: false,
     };
     let results = run_search(&fx.index_dir, &opts)?;
     assert_session(&results, "session-scoped");
     assert!(
         !results.iter().any(|r| r.session_id == "session-extra"),
         "project path prefix must not match sibling project names"
+    );
+    Ok(())
+}
+
+#[test]
+fn fuzzy_finds_session_when_phrase_is_split_across_lines() -> Result<()> {
+    let fx = Fixture::new()?;
+    fx.write_session(
+        "session-fuzzy",
+        &format!(
+            "{}\n{}\n",
+            jsonl_user("Марат сегодня заглянул"),
+            jsonl_assistant("позже пришли последние сообщения с упрёком, всё хорошо"),
+        ),
+    );
+    fx.full_reindex()?;
+
+    // Strict search: phrase is not on one line, so no snippets are produced.
+    let strict = fx.search("Марат, последние сообщения упрёком", SearchMode::Auto);
+    let strict_session = strict.iter().find(|r| r.session_id == "session-fuzzy");
+    if let Some(r) = strict_session {
+        assert!(
+            r.snippets.is_empty(),
+            "strict mode must not produce a snippet when the phrase isn't one line"
+        );
+    }
+
+    // Fuzzy: per-token snippets pick up "Марат" and "упрёком" separately.
+    let fuzzy = fx.search_fuzzy("Марат, последние сообщения упрёком");
+    let r = fuzzy
+        .iter()
+        .find(|r| r.session_id == "session-fuzzy")
+        .expect("fuzzy must surface the session");
+    let combined = r
+        .snippets
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(combined.contains("Марат"), "expected Марат in fuzzy snippets");
+    assert!(
+        combined.contains("упрёком"),
+        "expected упрёком in fuzzy snippets"
     );
     Ok(())
 }

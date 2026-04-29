@@ -49,6 +49,7 @@ pub struct SearchOptions {
     pub limit: usize,
     pub context_chars: usize,
     pub project_prefix: Option<PathBuf>,
+    pub fuzzy: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -141,7 +142,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     }
 
     let groups = group_hits_by_file(hits);
-    let by_session = build_session_results(groups, &opts.query, opts.context_chars);
+    let by_session = build_session_results(groups, &opts.query, opts.context_chars, opts.fuzzy);
 
     let mut sessions: Vec<SessionResult> = by_session.into_values().collect();
     sessions.sort_by(|a, b| b.last_msg_ms.cmp(&a.last_msg_ms));
@@ -176,6 +177,7 @@ fn build_session_results(
     by_file: BTreeMap<PathBuf, Vec<DocHit>>,
     query: &str,
     context_chars: usize,
+    fuzzy: bool,
 ) -> BTreeMap<String, SessionResult> {
     const MAX_SNIPPETS_PER_SESSION: usize = 10;
     let mut by_session: BTreeMap<String, SessionResult> = BTreeMap::new();
@@ -198,7 +200,7 @@ fn build_session_results(
             entry.project = project;
         }
 
-        let snippets = snippets_for_hits(&path, &hits, query, context_chars);
+        let snippets = snippets_for_hits(&path, &hits, query, context_chars, fuzzy);
         for s in snippets {
             if entry.snippets.len() >= MAX_SNIPPETS_PER_SESSION {
                 break;
@@ -234,10 +236,24 @@ fn snippets_for_hits(
     hits: &[DocHit],
     query: &str,
     context_chars: usize,
+    fuzzy: bool,
 ) -> Vec<Snippet> {
     let mut out = Vec::new();
     let mut seen_lines = BTreeSet::new();
-    let q_lower = query.to_lowercase();
+    let needles: Vec<String> = if fuzzy {
+        let mut tokens: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| t.chars().count() >= 2)
+            .map(|s| s.to_string())
+            .collect();
+        if tokens.is_empty() {
+            tokens.push(query.to_string());
+        }
+        tokens
+    } else {
+        vec![query.to_string()]
+    };
+    let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
     let mut budget = 6usize;
 
     for hit in hits {
@@ -255,7 +271,8 @@ fn snippets_for_hits(
         };
         let lines = split_keep_offsets(text);
         for (line_start, line) in lines {
-            if !line.to_lowercase().contains(&q_lower) {
+            let lower = line.to_lowercase();
+            if !needles_lower.iter().any(|n| lower.contains(n)) {
                 continue;
             }
             let abs = start as usize + line_start;
@@ -264,19 +281,27 @@ fn snippets_for_hits(
             }
             let tag = classify_line(line);
             let ts = extract_top_level_timestamp_ms(line);
-            for snippet_text in extract_all_snippets(line, query, context_chars, budget) {
-                if out
-                    .iter()
-                    .any(|existing: &Snippet| existing.text == snippet_text)
-                {
+            for (needle, needle_lower) in needles.iter().zip(needles_lower.iter()) {
+                if !lower.contains(needle_lower) {
                     continue;
                 }
-                out.push(Snippet {
-                    tag: tag.clone(),
-                    text: snippet_text,
-                    time_ms: ts,
-                });
-                budget = budget.saturating_sub(1);
+                for snippet_text in extract_all_snippets(line, needle, context_chars, budget) {
+                    if out
+                        .iter()
+                        .any(|existing: &Snippet| existing.text == snippet_text)
+                    {
+                        continue;
+                    }
+                    out.push(Snippet {
+                        tag: tag.clone(),
+                        text: snippet_text,
+                        time_ms: ts,
+                    });
+                    budget = budget.saturating_sub(1);
+                    if budget == 0 {
+                        break;
+                    }
+                }
                 if budget == 0 {
                     break;
                 }
@@ -625,8 +650,19 @@ pub fn select_visible_snippets<'a>(snippets: &'a [Snippet], verbose: bool) -> Ve
 }
 
 /// Print snippets respecting the three-tier fallback used by the Go tool.
-pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool) {
+pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool, fuzzy: bool) {
+    use crate::term::highlight_any;
     let show = select_visible_snippets(snippets, verbose);
+    let token_strings: Vec<String> = if fuzzy {
+        query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| t.chars().count() >= 2)
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let token_refs: Vec<&str> = token_strings.iter().map(|s| s.as_str()).collect();
 
     for (j, s) in show.iter().enumerate() {
         if j >= 5 {
@@ -643,14 +679,19 @@ pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool) {
         } else {
             String::new()
         };
+        let highlighted = if fuzzy && !token_refs.is_empty() {
+            highlight_any(&s.text, &token_refs)
+        } else {
+            highlight(&s.text, query)
+        };
         if !s.tag.is_empty() {
             println!(
                 "  {DIM}{ts}[{tag}]{RESET} {text}",
                 tag = s.tag,
-                text = highlight(&s.text, query),
+                text = highlighted,
             );
         } else {
-            println!("  {DIM}{ts}{RESET}{text}", text = highlight(&s.text, query),);
+            println!("  {DIM}{ts}{RESET}{text}", text = highlighted);
         }
     }
 }

@@ -85,6 +85,11 @@ pub struct SearchCmd {
     #[arg(long = "no-update", default_value_t = false)]
     pub no_update: bool,
 
+    /// Fuzzy: treat tokens independently. Show snippets per token even when the
+    /// full phrase isn't present on a single line.
+    #[arg(short = 'f', long = "fuzzy", default_value_t = false)]
+    pub fuzzy: bool,
+
     /// Search backend selection.
     #[arg(long = "mode", value_enum, default_value_t = SearchMode::Auto)]
     pub mode: SearchMode,

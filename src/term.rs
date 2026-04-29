@@ -94,6 +94,18 @@ pub fn fmt_size(bytes: u64) -> String {
     }
 }
 
+/// Highlight every case-insensitive occurrence of any of `queries` in `text`.
+/// Empty queries are skipped. Used by fuzzy search to light up each token.
+pub fn highlight_any(text: &str, queries: &[&str]) -> String {
+    let mut out = text.to_string();
+    for q in queries {
+        if !q.is_empty() {
+            out = highlight(&out, q);
+        }
+    }
+    out
+}
+
 /// Highlight every case-insensitive occurrence of `query` inside `text` with bold red.
 pub fn highlight(text: &str, query: &str) -> String {
     if query.is_empty() {

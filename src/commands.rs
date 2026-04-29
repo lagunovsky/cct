@@ -271,6 +271,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         limit: args.limit,
         context_chars: args.context,
         project_prefix: project_prefix.clone(),
+        fuzzy: args.fuzzy,
     };
     let search_start = Instant::now();
     let mut sessions = search::run_search(&index_dir, &opts)?;
@@ -287,7 +288,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         for s in sessions.iter_mut().take(to_show) {
             let stats = compute_session_stats(s);
             search::print_session_header(s, stats.prompts, stats.tools, stats.bytes);
-            search::print_snippets(&s.snippets, &query, args.verbose >= 1);
+            search::print_snippets(&s.snippets, &query, args.verbose >= 1, args.fuzzy);
             if args.verbose >= 1 {
                 for f in &s.files {
                     println!("  {DIM}{}{RESET}", f.display());
