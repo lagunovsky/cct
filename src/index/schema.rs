@@ -113,3 +113,7 @@ pub fn register_tokenizers(index: &Index) -> Result<()> {
 pub fn subindex_dir(root: &Path, kind: IndexKind) -> PathBuf {
     root.join(kind.as_str())
 }
+
+pub fn delta_dir(root: &Path) -> PathBuf {
+    root.join("delta")
+}

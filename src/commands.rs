@@ -10,9 +10,9 @@ use anyhow::{anyhow, bail, Result};
 use crate::cli;
 use crate::fs_scan::collect_cct_layout;
 use crate::index::build::run_full_reindex;
-use crate::index::compact::run_compact;
+use crate::index::compact::{optimize_delta, run_compact};
 use crate::index::search::{self, SearchOptions};
-use crate::index::update::{build_plan, needs_update, run_update};
+use crate::index::update::{build_plan, flush_delta, needs_update, run_update};
 use crate::index::writer::{MergePolicyMode, WriterConfig};
 use crate::index::IndexKind;
 use crate::path_codec::{
@@ -173,7 +173,7 @@ pub fn run_silent_update(index_dir: &Path) -> Result<()> {
     let files = collect_cct_layout(&source)?;
     let plan = build_plan(index_dir, Some(source.clone()), files)?;
     if !needs_update(&plan) {
-        return Ok(());
+        return flush_delta(index_dir, WriterConfig::for_incremental_update(), false);
     }
     run_update(
         index_dir,
@@ -181,6 +181,7 @@ pub fn run_silent_update(index_dir: &Path) -> Result<()> {
         WriterConfig::for_incremental_update(),
         false,
     )?;
+    flush_delta(index_dir, WriterConfig::for_incremental_update(), false)?;
     Ok(())
 }
 
@@ -313,6 +314,11 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         "\n{DIM}{count} sessions in {elapsed:?}{RESET}{breakdown}",
         count = to_show,
     );
+    match optimize_delta(&index_dir, WriterConfig::for_incremental_update()) {
+        Ok(Some(delta_elapsed)) => println!("{DIM}delta optimize {delta_elapsed:?}{RESET}"),
+        Ok(None) => {}
+        Err(err) => eprintln!("{DIM}delta optimize skipped: {err:#}{RESET}"),
+    }
     Ok(())
 }
 

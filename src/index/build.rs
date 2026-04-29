@@ -424,6 +424,60 @@ pub fn open_existing_targets(
     Ok(targets)
 }
 
+pub fn create_or_open_targets(
+    index_dir: &Path,
+    enabled: &BTreeSet<IndexKind>,
+    config: WriterConfig,
+) -> Result<Vec<BuildTarget>> {
+    let mut targets = Vec::new();
+    fs::create_dir_all(index_dir)
+        .with_context(|| format!("create index root {}", index_dir.display()))?;
+    for kind in enabled {
+        let dir = subindex_dir(index_dir, *kind);
+        let (index, fields) = if dir.exists() {
+            let index = Index::open_in_dir(&dir)
+                .with_context(|| format!("open index {}", dir.display()))?;
+            register_tokenizers(&index)?;
+            let schema = index.schema();
+            let fields = fields_from_schema(&schema).with_context(|| {
+                format!(
+                    "schema in {} is old or incompatible; rebuild with `cct reindex`",
+                    dir.display()
+                )
+            })?;
+            (index, fields)
+        } else {
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("create subindex {}", dir.display()))?;
+            let (schema, fields) = schema_and_fields(*kind);
+            let index = Index::create_in_dir(&dir, schema)?;
+            register_tokenizers(&index)?;
+            (index, fields)
+        };
+        let writer = create_writer(&index, &config, enabled.len())?;
+        targets.push(BuildTarget {
+            kind: *kind,
+            fields,
+            writer,
+        });
+    }
+    Ok(targets)
+}
+
+pub fn open_optional_targets(
+    index_dir: &Path,
+    enabled: &BTreeSet<IndexKind>,
+    config: WriterConfig,
+) -> Result<Vec<BuildTarget>> {
+    let mut existing = BTreeSet::new();
+    for kind in enabled {
+        if subindex_dir(index_dir, *kind).is_dir() {
+            existing.insert(*kind);
+        }
+    }
+    open_existing_targets(index_dir, &existing, config)
+}
+
 pub fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0;
     if path.is_dir() {

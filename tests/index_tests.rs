@@ -10,9 +10,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use cct::fs_scan::collect_cct_layout;
-use cct::index::build::run_full_reindex;
+use cct::index::build::{run_full_reindex, subindex_segment_count};
+use cct::index::catalog::read_delta_catalog;
+use cct::index::compact::optimize_delta;
+use cct::index::schema::delta_dir;
 use cct::index::search::{run_search, SearchMode, SearchOptions, SessionResult};
-use cct::index::update::{build_plan, needs_update, run_update};
+use cct::index::update::{build_plan, flush_delta, needs_update, run_update};
 use cct::index::writer::WriterConfig;
 use cct::index::IndexKind;
 
@@ -199,6 +202,139 @@ fn append_update_indexes_only_complete_lines() -> Result<()> {
     assert!(
         results.is_empty(),
         "partial trailing line should not be searchable yet"
+    );
+    Ok(())
+}
+
+#[test]
+fn append_update_writes_delta_not_main_segments() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-delta",
+        &format!("{}\n", jsonl_user("first line before delta")),
+    );
+    fx.full_reindex()?;
+    let main_word_segments = subindex_segment_count(&fx.index_dir, IndexKind::Word)?;
+
+    let mut content = fs::read_to_string(&session_path)?;
+    content.push_str(&jsonl_user("second line DELTATERM"));
+    content.push('\n');
+    fs::write(&session_path, content)?;
+    fx.update()?;
+
+    assert_session(&fx.search("DELTATERM", SearchMode::Auto), "session-delta");
+    assert_eq!(
+        subindex_segment_count(&fx.index_dir, IndexKind::Word)?,
+        main_word_segments,
+        "append should not add a main word segment"
+    );
+    let delta = delta_dir(&fx.index_dir);
+    assert!(delta.join("word").is_dir(), "delta word index must exist");
+    assert!(
+        delta.join("trigram").is_dir(),
+        "delta trigram index must exist"
+    );
+    assert!(
+        !delta.join("path").exists(),
+        "append should not touch delta path"
+    );
+    assert_eq!(read_delta_catalog(&fx.index_dir)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn rewrite_clears_stale_delta_hits() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-delta-rewrite",
+        &format!("{}\n", jsonl_user("first line")),
+    );
+    fx.full_reindex()?;
+
+    let mut content = fs::read_to_string(&session_path)?;
+    content.push_str(&jsonl_user("temporary STALEDELTA"));
+    content.push('\n');
+    fs::write(&session_path, content)?;
+    fx.update()?;
+    assert_session(
+        &fx.search("STALEDELTA", SearchMode::Auto),
+        "session-delta-rewrite",
+    );
+
+    fs::write(
+        &session_path,
+        format!("{}\n", jsonl_user("fresh REWRITTENDELTA")),
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let now = std::time::SystemTime::now();
+    filetime::set_file_mtime(&session_path, filetime::FileTime::from_system_time(now)).ok();
+    fx.update()?;
+
+    assert!(fx.search("STALEDELTA", SearchMode::Auto).is_empty());
+    assert_session(
+        &fx.search("REWRITTENDELTA", SearchMode::Auto),
+        "session-delta-rewrite",
+    );
+    assert!(read_delta_catalog(&fx.index_dir)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn flush_delta_moves_append_ranges_to_main_and_clears_delta() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-delta-flush",
+        &format!("{}\n", jsonl_user("first line")),
+    );
+    fx.full_reindex()?;
+
+    let mut content = fs::read_to_string(&session_path)?;
+    content.push_str(&jsonl_user("background FLUSHDELTA"));
+    content.push('\n');
+    fs::write(&session_path, content)?;
+    fx.update()?;
+    assert_eq!(read_delta_catalog(&fx.index_dir)?.len(), 1);
+
+    flush_delta(&fx.index_dir, WriterConfig::for_incremental_update(), false)?;
+    assert_session(
+        &fx.search("FLUSHDELTA", SearchMode::Auto),
+        "session-delta-flush",
+    );
+    assert!(!delta_dir(&fx.index_dir).exists());
+    assert!(read_delta_catalog(&fx.index_dir)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn optimize_delta_compacts_append_segments() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-delta-optimize",
+        &format!("{}\n", jsonl_user("first line")),
+    );
+    fx.full_reindex()?;
+
+    let mut content = fs::read_to_string(&session_path)?;
+    content.push_str(&jsonl_user("first OPTDELTA"));
+    content.push('\n');
+    fs::write(&session_path, &content)?;
+    fx.update()?;
+
+    content.push_str(&jsonl_user("second OPTDELTA"));
+    content.push('\n');
+    fs::write(&session_path, content)?;
+    fx.update()?;
+
+    let delta = delta_dir(&fx.index_dir);
+    assert!(
+        subindex_segment_count(&delta, IndexKind::Word)? > 1,
+        "two append commits should create multiple delta word segments"
+    );
+    assert!(optimize_delta(&fx.index_dir, WriterConfig::for_incremental_update())?.is_some());
+    assert_eq!(subindex_segment_count(&delta, IndexKind::Word)?, 1);
+    assert_session(
+        &fx.search("OPTDELTA", SearchMode::Auto),
+        "session-delta-optimize",
     );
     Ok(())
 }

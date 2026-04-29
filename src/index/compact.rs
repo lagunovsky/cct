@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tantivy::index::{SegmentId, SegmentMeta};
@@ -12,7 +12,7 @@ use crate::term::fmt_size;
 
 use super::build::{dir_size, subindex_segment_count};
 use super::catalog::read_manifest;
-use super::schema::{subindex_dir, IndexKind};
+use super::schema::{delta_dir, subindex_dir, IndexKind};
 use super::writer::{create_writer, print_writer_config, MergePolicyMode, WriterConfig};
 
 pub fn run_compact(
@@ -58,6 +58,22 @@ pub fn run_compact(
         fmt_size(total_index_bytes)
     );
     Ok(())
+}
+
+pub fn optimize_delta(index_dir: &Path, mut config: WriterConfig) -> Result<Option<Duration>> {
+    let root = delta_dir(index_dir);
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    config.merge_policy = MergePolicyMode::None;
+
+    let start = Instant::now();
+    for kind in [IndexKind::Word, IndexKind::Trigram, IndexKind::Path] {
+        if subindex_dir(&root, kind).is_dir() {
+            compact_one_index_quiet(&root, kind, config, 1)?;
+        }
+    }
+    Ok(Some(start.elapsed()))
 }
 
 fn compact_one_index(
@@ -119,6 +135,36 @@ fn compact_one_index(
         fmt_size(before_size),
         fmt_size(after_size)
     );
+    Ok(())
+}
+
+fn compact_one_index_quiet(
+    root: &Path,
+    kind: IndexKind,
+    config: WriterConfig,
+    target_segments: usize,
+) -> Result<()> {
+    let dir = subindex_dir(root, kind);
+    let index =
+        Index::open_in_dir(&dir).with_context(|| format!("open index {}", dir.display()))?;
+    let metas = index.searchable_segment_metas()?;
+    if metas.len() <= target_segments {
+        return Ok(());
+    }
+
+    let groups = segment_merge_groups(metas, target_segments);
+    let mut writer = create_writer(&index, &config, 1)?;
+    let mut futures = Vec::new();
+    for group in &groups {
+        if group.len() <= 1 {
+            continue;
+        }
+        futures.push(writer.merge(group));
+    }
+    for future in futures {
+        future.wait()?;
+    }
+    writer.wait_merging_threads()?;
     Ok(())
 }
 

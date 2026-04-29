@@ -11,6 +11,8 @@ use super::schema::IndexKind;
 use super::writer::WriterConfig;
 
 const CATALOG_HEADER: &str = "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tpath";
+const DELTA_CATALOG_HEADER: &str =
+    "file_id\tstart_offset\tend_offset\tstart_chunk_id\tend_chunk_id\tpath";
 
 #[derive(Clone, Debug)]
 pub struct CatalogEntry {
@@ -20,6 +22,16 @@ pub struct CatalogEntry {
     pub mtime_ms: u128,
     pub indexed_offset: u64,
     pub next_chunk_id: u64,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeltaCatalogEntry {
+    pub file_id: u64,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub start_chunk_id: u64,
+    pub end_chunk_id: u64,
     pub path: PathBuf,
 }
 
@@ -102,6 +114,94 @@ pub fn write_catalog(index_dir: &Path, entries: &[CatalogEntry]) -> Result<PathB
     f.flush()?;
     drop(f);
     fs::rename(&tmp_path, &path).with_context(|| format!("replace catalog {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn delta_catalog_path(index_dir: &Path) -> PathBuf {
+    super::schema::delta_dir(index_dir).join("catalog.tsv")
+}
+
+pub fn read_delta_catalog(index_dir: &Path) -> Result<Vec<DeltaCatalogEntry>> {
+    let path = delta_catalog_path(index_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut lines = raw.lines();
+    let header = lines.next().unwrap_or_default();
+    if header != DELTA_CATALOG_HEADER {
+        bail!(
+            "delta catalog schema is old or incompatible: {}\nRemove delta or run `cct reindex`.",
+            path.display()
+        );
+    }
+
+    let mut entries = Vec::new();
+    for (line_no, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(6, '\t').collect();
+        if parts.len() != 6 {
+            bail!(
+                "bad delta catalog line {} in {}",
+                line_no + 2,
+                path.display()
+            );
+        }
+        entries.push(DeltaCatalogEntry {
+            file_id: parts[0]
+                .parse()
+                .with_context(|| format!("bad file_id at delta catalog line {}", line_no + 2))?,
+            start_offset: parts[1].parse().with_context(|| {
+                format!("bad start_offset at delta catalog line {}", line_no + 2)
+            })?,
+            end_offset: parts[2]
+                .parse()
+                .with_context(|| format!("bad end_offset at delta catalog line {}", line_no + 2))?,
+            start_chunk_id: parts[3].parse().with_context(|| {
+                format!("bad start_chunk_id at delta catalog line {}", line_no + 2)
+            })?,
+            end_chunk_id: parts[4].parse().with_context(|| {
+                format!("bad end_chunk_id at delta catalog line {}", line_no + 2)
+            })?,
+            path: PathBuf::from(parts[5]),
+        });
+    }
+    Ok(entries)
+}
+
+pub fn write_delta_catalog(index_dir: &Path, entries: &[DeltaCatalogEntry]) -> Result<PathBuf> {
+    let delta = super::schema::delta_dir(index_dir);
+    fs::create_dir_all(&delta).ok();
+    let path = delta_catalog_path(index_dir);
+    let tmp_path = delta.join("catalog.tsv.tmp");
+    let mut sorted: Vec<&DeltaCatalogEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.file_id
+            .cmp(&b.file_id)
+            .then_with(|| a.start_offset.cmp(&b.start_offset))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let mut f = BufWriter::new(File::create(&tmp_path)?);
+    writeln!(f, "{DELTA_CATALOG_HEADER}")?;
+    for e in sorted {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            e.file_id,
+            e.start_offset,
+            e.end_offset,
+            e.start_chunk_id,
+            e.end_chunk_id,
+            e.path.to_string_lossy()
+        )?;
+    }
+    f.flush()?;
+    drop(f);
+    fs::rename(&tmp_path, &path)
+        .with_context(|| format!("replace delta catalog {}", path.display()))?;
     Ok(path)
 }
 

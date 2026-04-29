@@ -19,7 +19,7 @@ use crate::text::{
 
 use super::build::{read_file_range, stored_string, stored_u64};
 use super::schema::{
-    fields_from_schema, register_tokenizers, subindex_dir, IndexKind, NGRAM_TOKENIZER,
+    delta_dir, fields_from_schema, register_tokenizers, subindex_dir, IndexKind, NGRAM_TOKENIZER,
     WORD_TOKENIZER,
 };
 
@@ -122,13 +122,17 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
 
     let mut hits: Vec<DocHit> = Vec::new();
     let total_limit = candidate_limit(opts.limit, opts.project_prefix.is_some());
-    for kind in kinds {
-        if !subindex_dir(index_dir, kind).exists() {
-            continue;
-        }
-        match search_one_index(index_dir, kind, &opts.query, total_limit) {
-            Ok(rows) => hits.extend(rows),
-            Err(err) => eprintln!("  warning: {} search failed: {err:#}", kind.as_str()),
+    let delta = delta_dir(index_dir);
+    let roots = [index_dir.to_path_buf(), delta];
+    for root in roots {
+        for kind in &kinds {
+            if !subindex_dir(&root, *kind).exists() {
+                continue;
+            }
+            match search_one_index(&root, *kind, &opts.query, total_limit) {
+                Ok(rows) => hits.extend(rows),
+                Err(err) => eprintln!("  warning: {} search failed: {err:#}", kind.as_str()),
+            }
         }
     }
 
