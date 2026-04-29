@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tantivy::{doc, Index, IndexWriter, Term};
@@ -231,14 +231,17 @@ pub fn add_whole_file(
     file: &DiscoveredFile,
     file_id: u64,
 ) -> Result<(CatalogEntry, u64)> {
+    let before_read = file_identity(&file.path).ok();
     let data = fs::read(&file.path).with_context(|| format!("read {}", file.path.display()))?;
+    let after_read = file_identity(&file.path).ok();
+    let (size, mtime_ms) = catalog_identity_for_read(file, data.len(), before_read, after_read);
     let indexed_len = indexable_prefix_len(&file.path, &data);
     let path_string = file.path.to_string_lossy().into_owned();
     let mut entry = CatalogEntry {
         file_id,
         kind: file.kind.as_str().to_string(),
-        size: file.size,
-        mtime_ms: file.mtime_ms,
+        size,
+        mtime_ms,
         indexed_offset: indexed_len as u64,
         next_chunk_id: 0,
         path: file.path.clone(),
@@ -250,6 +253,33 @@ pub fn add_whole_file(
 
     let chunks = add_content_bytes(targets, &mut entry, &data[..indexed_len], 0, &path_string)?;
     Ok((entry, chunks))
+}
+
+fn catalog_identity_for_read(
+    file: &DiscoveredFile,
+    read_len: usize,
+    before_read: Option<(u64, u128)>,
+    after_read: Option<(u64, u128)>,
+) -> (u64, u128) {
+    let read_size = read_len as u64;
+    if let (Some(before), Some(after)) = (before_read, after_read) {
+        if before == after && after.0 == read_size {
+            return after;
+        }
+        return (read_size, before.1);
+    }
+    (read_size, file.mtime_ms)
+}
+
+fn file_identity(path: &Path) -> Result<(u64, u128)> {
+    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    Ok((meta.len(), mtime_ms))
 }
 
 pub struct AppendResult {

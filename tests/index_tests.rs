@@ -240,6 +240,38 @@ fn unchanged_update_is_a_noop() -> Result<()> {
 }
 
 #[test]
+fn reindex_catalog_uses_fresh_identity_after_stale_scan() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-stale-scan",
+        &format!("{}\n", jsonl_user("initial snapshot term")),
+    );
+    let files = collect_cct_layout(&fx.source)?;
+
+    let mut content = fs::read_to_string(&session_path)?;
+    content.push_str(&jsonl_user("late line after scan"));
+    content.push('\n');
+    fs::write(&session_path, content)?;
+
+    let enabled = IndexKind::all();
+    run_full_reindex(
+        &fx.source,
+        &fx.index_dir,
+        &enabled,
+        files,
+        WriterConfig::for_full_reindex(),
+        false,
+    )?;
+
+    assert_session(&fx.search("late", SearchMode::Auto), "session-stale-scan");
+    assert!(
+        !fx.update_dry()?,
+        "freshly reindexed file should not require update when it only changed before read"
+    );
+    Ok(())
+}
+
+#[test]
 fn deleted_file_removes_hits() -> Result<()> {
     let fx = Fixture::new()?;
     let path = fx.write_session(
