@@ -469,7 +469,7 @@ fn snippet_window(text: &str, match_idx: usize, match_len: usize, context_chars:
             .trim_start_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')'))
             .trim()
             .to_string();
-        result = format!("{GRAY}⋯ {RESET}{result}");
+        result = format!("⋯ {result}");
     }
     if truncated_right {
         if let Some(sp_byte) = result.rfind(' ') {
@@ -483,14 +483,15 @@ fn snippet_window(text: &str, match_idx: usize, match_len: usize, context_chars:
             .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '('))
             .trim()
             .to_string();
-        result = format!("{result}{GRAY} ⋯{RESET}");
+        result = format!("{result} ⋯");
     }
     result
 }
 
 /// Replace runs of 3+ spaces (terminal padding, table layout, etc.) with a
-/// single dim ellipsis so snippets stay readable when the original text is
-/// heavily indented.
+/// single ellipsis so snippets stay readable when the original text is
+/// heavily indented. The ellipsis is colorized at print time, not stored
+/// inside the snippet text — that way `highlight()` never sees ANSI escapes.
 fn collapse_long_spaces(s: &str) -> String {
     const THRESHOLD: usize = 3;
     let mut out = String::with_capacity(s.len());
@@ -506,11 +507,7 @@ fn collapse_long_spaces(s: &str) -> String {
             run += 1;
         }
         if run >= THRESHOLD {
-            out.push(' ');
-            out.push_str(GRAY);
-            out.push('⋯');
-            out.push_str(RESET);
-            out.push(' ');
+            out.push_str(" ⋯ ");
         } else {
             for _ in 0..run {
                 out.push(' ');
@@ -518,6 +515,13 @@ fn collapse_long_spaces(s: &str) -> String {
         }
     }
     out
+}
+
+/// Wrap every literal `⋯` (inserted by `collapse_long_spaces` /
+/// `snippet_window`) in dim ANSI codes. Done after `highlight()` so the
+/// highlighter never sees escape sequences and risks matching them.
+pub fn dim_ellipses(text: &str) -> String {
+    text.replace('⋯', &format!("{GRAY}⋯{RESET}"))
 }
 
 fn search_one_index(
@@ -684,6 +688,7 @@ pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool, fuzzy: b
         } else {
             highlight(&s.text, query)
         };
+        let highlighted = dim_ellipses(&highlighted);
         if !s.tag.is_empty() {
             println!(
                 "  {DIM}{ts}[{tag}]{RESET} {text}",

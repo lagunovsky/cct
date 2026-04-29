@@ -97,12 +97,62 @@ pub fn fmt_size(bytes: u64) -> String {
 /// Highlight every case-insensitive occurrence of any of `queries` in `text`.
 /// Empty queries are skipped. Used by fuzzy search to light up each token.
 pub fn highlight_any(text: &str, queries: &[&str]) -> String {
-    let mut out = text.to_string();
+    let (lower_text, spans) = lowercase_with_spans(text);
+    let mut ranges = Vec::new();
     for q in queries {
-        if !q.is_empty() {
-            out = highlight(&out, q);
+        if q.is_empty() {
+            continue;
+        }
+        let lower_q = q.to_lowercase();
+        if lower_q.is_empty() {
+            continue;
+        }
+
+        let mut lower_from = 0;
+        while lower_from < lower_text.len() {
+            let Some(idx) = lower_text[lower_from..].find(&lower_q) else {
+                break;
+            };
+            let lower_start = lower_from + idx;
+            let lower_end = lower_start + lower_q.len();
+            if let Some(range) = original_span_for_lower_match(&spans, lower_start, lower_end) {
+                ranges.push(range);
+            }
+            lower_from = lower_end;
         }
     }
+
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+
+    ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if start >= end {
+            continue;
+        }
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let mut out =
+        String::with_capacity(text.len() + merged.len() * (RED.len() + BOLD.len() + RESET.len()));
+    let mut original_from = 0;
+    for (start, end) in merged {
+        out.push_str(&text[original_from..start]);
+        out.push_str(RED);
+        out.push_str(BOLD);
+        out.push_str(&text[start..end]);
+        out.push_str(RESET);
+        original_from = end;
+    }
+    out.push_str(&text[original_from..]);
     out
 }
 
@@ -230,5 +280,20 @@ mod tests {
         let rendered = highlight("İstanbul pressure note", "İstanbul");
         assert!(rendered.contains("İstanbul"));
         assert!(rendered.contains(RED));
+    }
+
+    #[test]
+    fn highlight_any_does_not_match_ansi_from_previous_tokens() {
+        let rendered = highlight_any("foo 31", &["foo", "31"]);
+        assert_eq!(
+            rendered,
+            format!("{RED}{BOLD}foo{RESET} {RED}{BOLD}31{RESET}")
+        );
+    }
+
+    #[test]
+    fn highlight_any_merges_overlapping_tokens() {
+        let rendered = highlight_any("foobar", &["foo", "foobar"]);
+        assert_eq!(rendered, format!("{RED}{BOLD}foobar{RESET}"));
     }
 }
