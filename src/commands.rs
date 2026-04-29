@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 
 use crate::cli;
-use crate::fs_scan::collect_cct_layout;
+use crate::fs_scan::{collect_cct_layout, collect_one_project};
 use crate::index::build::run_full_reindex;
 use crate::index::compact::{optimize_delta, run_compact};
 use crate::index::search::{self, SearchOptions};
-use crate::index::update::{build_plan, flush_delta, needs_update, run_update};
+use crate::index::update::{build_plan, build_plan_scoped, flush_delta, needs_update, run_update};
 use crate::index::writer::{MergePolicyMode, WriterConfig};
 use crate::index::IndexKind;
 use crate::path_codec::{
@@ -222,8 +222,12 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         } else {
             let scan_start = Instant::now();
             let sp = Spinner::start("scanning sessions...");
-            let files = collect_cct_layout(&source)?;
-            let plan = build_plan(&index_dir, Some(source.clone()), files)?;
+            let (files, scope) = if let Some(prefix) = project_prefix.as_deref() {
+                (collect_one_project(prefix)?, Some(prefix))
+            } else {
+                (collect_cct_layout(&source)?, None)
+            };
+            let plan = build_plan_scoped(&index_dir, Some(source.clone()), files, scope)?;
             let need = needs_update(&plan);
             scan_elapsed = scan_start.elapsed();
             if need {

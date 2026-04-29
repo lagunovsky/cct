@@ -9,13 +9,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use cct::fs_scan::collect_cct_layout;
+use cct::fs_scan::{collect_cct_layout, collect_one_project};
 use cct::index::build::{run_full_reindex, subindex_segment_count};
 use cct::index::catalog::read_delta_catalog;
 use cct::index::compact::optimize_delta;
 use cct::index::schema::delta_dir;
 use cct::index::search::{run_search, SearchMode, SearchOptions, SessionResult};
-use cct::index::update::{build_plan, flush_delta, needs_update, run_update};
+use cct::index::update::{build_plan, build_plan_scoped, flush_delta, needs_update, run_update};
 use cct::index::writer::WriterConfig;
 use cct::index::IndexKind;
 
@@ -630,5 +630,57 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
         !results.iter().any(|r| r.session_id == "session-extra"),
         "project path prefix must not match sibling project names"
     );
+    Ok(())
+}
+
+#[test]
+fn scoped_update_leaves_other_projects_intact() -> Result<()> {
+    let fx = Fixture::new()?;
+    let other_project = fx.source.join("-tmp-cct-test-other");
+    fs::create_dir_all(&other_project)?;
+
+    let scoped_session = fx.write_session(
+        "session-scoped-upd",
+        &format!("{}\n", jsonl_user("alpha SCOPEDOLD")),
+    );
+    fs::write(
+        other_project.join("session-other.jsonl"),
+        format!("{}\n", jsonl_user("bravo OTHERTERM keeps existing")),
+    )?;
+    fx.full_reindex()?;
+
+    // Sanity: both terms searchable globally before the scoped update.
+    assert_session(&fx.search("SCOPEDOLD", SearchMode::Auto), "session-scoped-upd");
+    assert_session(&fx.search("OTHERTERM", SearchMode::Auto), "session-other");
+
+    // Mutate the scoped project: drop the old session, add a new one.
+    fs::remove_file(&scoped_session)?;
+    fs::write(
+        fx.project_dir.join("session-scoped-new.jsonl"),
+        format!("{}\n", jsonl_user("alpha SCOPEDNEW")),
+    )?;
+
+    let scope = fx.project_dir.clone();
+    let files = collect_one_project(&scope)?;
+    let plan =
+        build_plan_scoped(&fx.index_dir, Some(fx.source.clone()), files, Some(&scope))?;
+    let _ = run_update(
+        &fx.index_dir,
+        plan,
+        WriterConfig::for_incremental_update(),
+        false,
+    )?;
+
+    // Scoped changes took effect.
+    assert!(
+        fx.search("SCOPEDOLD", SearchMode::Auto).is_empty(),
+        "deleted scoped session must be gone"
+    );
+    assert_session(
+        &fx.search("SCOPEDNEW", SearchMode::Auto),
+        "session-scoped-new",
+    );
+    // The other project is untouched: same term still resolves to its session.
+    assert_session(&fx.search("OTHERTERM", SearchMode::Auto), "session-other");
     Ok(())
 }

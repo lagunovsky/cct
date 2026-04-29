@@ -39,6 +39,10 @@ pub struct UpdatePlan {
     pub enabled: BTreeSet<IndexKind>,
     pub catalog_by_path: BTreeMap<PathBuf, CatalogEntry>,
     pub scanned: BTreeMap<PathBuf, DiscoveredFile>,
+    /// Catalog entries outside the current scope. Carried through `run_update`
+    /// without re-stat'ing or re-indexing them so a scoped update does not
+    /// accidentally drop unrelated projects.
+    pub preserved: Vec<CatalogEntry>,
 }
 
 /// Quick boolean check: would a full update make any changes? Used to skip the
@@ -65,6 +69,17 @@ pub fn build_plan(
     source_override: Option<PathBuf>,
     files: Vec<DiscoveredFile>,
 ) -> Result<UpdatePlan> {
+    build_plan_scoped(index_dir, source_override, files, None)
+}
+
+/// Like `build_plan` but treats catalog entries whose path is not under
+/// `scope` as untouched — they ride through `run_update` unchanged.
+pub fn build_plan_scoped(
+    index_dir: &Path,
+    source_override: Option<PathBuf>,
+    files: Vec<DiscoveredFile>,
+    scope: Option<&Path>,
+) -> Result<UpdatePlan> {
     let manifest = read_manifest(index_dir)?;
     let source = source_override
         .or(manifest.source)
@@ -74,13 +89,25 @@ pub fn build_plan(
 
     let scanned: BTreeMap<PathBuf, DiscoveredFile> =
         files.into_iter().map(|f| (f.path.clone(), f)).collect();
-    let catalog_by_path: BTreeMap<PathBuf, CatalogEntry> =
-        catalog.into_iter().map(|e| (e.path.clone(), e)).collect();
+
+    let mut catalog_by_path: BTreeMap<PathBuf, CatalogEntry> = BTreeMap::new();
+    let mut preserved: Vec<CatalogEntry> = Vec::new();
+    for entry in catalog {
+        if let Some(scope) = scope {
+            if !entry.path.starts_with(scope) {
+                preserved.push(entry);
+                continue;
+            }
+        }
+        catalog_by_path.insert(entry.path.clone(), entry);
+    }
+
     Ok(UpdatePlan {
         source,
         enabled,
         catalog_by_path,
         scanned,
+        preserved,
     })
 }
 
@@ -98,6 +125,7 @@ pub fn run_update(
         enabled,
         mut catalog_by_path,
         scanned,
+        preserved,
     } = plan;
     let start = Instant::now();
 
@@ -140,14 +168,16 @@ pub fn run_update(
     let mut delta_catalog = read_delta_catalog(index_dir)?;
     let mut delta_catalog_dirty = false;
     let mut stats = UpdateStats::default();
-    let mut next_file_id = catalog_by_path
-        .values()
-        .map(|e| e.file_id)
+    let max_in_scope = catalog_by_path.values().map(|e| e.file_id).max();
+    let max_preserved = preserved.iter().map(|e| e.file_id).max();
+    let mut next_file_id = max_in_scope
+        .into_iter()
+        .chain(max_preserved)
         .max()
         .unwrap_or(0)
         .saturating_add(1);
 
-    let mut new_catalog: Vec<CatalogEntry> = Vec::new();
+    let mut new_catalog: Vec<CatalogEntry> = preserved;
     let scanned_paths: BTreeSet<PathBuf> = scanned.keys().cloned().collect();
 
     for (path, mut entry) in std::mem::take(&mut catalog_by_path) {
