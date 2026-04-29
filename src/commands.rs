@@ -273,6 +273,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     let search_elapsed = search_start.elapsed();
     sp.stop();
 
+    let render_start = Instant::now();
     let total = sessions.len();
     let to_show = sessions.len().min(args.limit);
     if to_show == 0 {
@@ -295,18 +296,26 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
             );
         }
     }
+    let render_elapsed = render_start.elapsed();
 
     let elapsed = start.elapsed();
-    let mut parts: Vec<String> = Vec::new();
-    if scan_elapsed.as_millis() >= 5 {
-        parts.push(format!("scan {scan_elapsed:?}"));
-    }
-    if update_elapsed.as_millis() >= 5 {
-        parts.push(format!("update {update_elapsed:?}"));
-    }
-    parts.push(format!("search {search_elapsed:?}"));
-    let breakdown = if parts.len() > 1 {
-        format!(" ({DIM}{}{RESET})", parts.join(" + "))
+    let breakdown = if args.verbose >= 2 {
+        let mut parts: Vec<(&str, Duration)> = Vec::new();
+        if scan_elapsed.as_millis() >= 5 {
+            parts.push(("scan", scan_elapsed));
+        }
+        if update_elapsed.as_millis() >= 5 {
+            parts.push(("update", update_elapsed));
+        }
+        parts.push(("search", search_elapsed));
+        if render_elapsed.as_millis() >= 5 {
+            parts.push(("render", render_elapsed));
+        }
+        if parts.len() > 1 {
+            format!("{DIM} ({}){RESET}", format_timing_parts(&parts))
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };
@@ -314,12 +323,35 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         "\n{DIM}{count} sessions in {elapsed:?}{RESET}{breakdown}",
         count = to_show,
     );
-    match optimize_delta(&index_dir, WriterConfig::for_incremental_update()) {
-        Ok(Some(delta_elapsed)) => println!("{DIM}delta optimize {delta_elapsed:?}{RESET}"),
-        Ok(None) => {}
+    match optimize_delta(&index_dir, WriterConfig::for_delta_update()) {
+        Ok(Some(delta_elapsed))
+            if args.verbose >= 2 || delta_elapsed >= Duration::from_secs(1) =>
+        {
+            println!("{DIM}delta optimize {delta_elapsed:?}{RESET}");
+        }
+        Ok(_) => {}
         Err(err) => eprintln!("{DIM}delta optimize skipped: {err:#}{RESET}"),
     }
     Ok(())
+}
+
+fn format_timing_parts(parts: &[(&str, Duration)]) -> String {
+    parts
+        .iter()
+        .map(|(label, duration)| format!("{label} {}", format_duration(*duration)))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn format_duration(duration: Duration) -> String {
+    let ms = duration.as_secs_f64() * 1000.0;
+    if ms >= 100.0 {
+        format!("{ms:.0}ms")
+    } else if ms >= 10.0 {
+        format!("{ms:.1}ms")
+    } else {
+        format!("{ms:.2}ms")
+    }
 }
 
 fn print_search_header(query: &str, args: &cli::SearchCmd, label: Option<&str>) {

@@ -109,6 +109,7 @@ pub fn run_update(
     let active = affected_indexes(&enabled, &catalog_by_path, &scanned);
     let main_names = index_names(&active.main);
     let delta_names = index_names(&active.delta);
+    let delta_config = WriterConfig::for_delta_update();
     if verbose {
         eprintln!(
             "Updating {} from {} [{}]",
@@ -117,9 +118,13 @@ pub fn run_update(
             enabled_names,
         );
         eprintln!("  active main writers [{main_names}], delta writers [{delta_names}]");
-        let writer_count = active.main.len().max(active.delta.len());
-        if writer_count > 0 {
-            print_writer_config(config, writer_count);
+        if !active.main.is_empty() {
+            eprintln!("  main writer:");
+            print_writer_config(config, active.main.len());
+        }
+        if !active.delta.is_empty() {
+            eprintln!("  delta writer:");
+            print_writer_config(delta_config, active.delta.len());
         }
     }
 
@@ -128,9 +133,9 @@ pub fn run_update(
     let mut delta_targets = if active.delta.is_empty() {
         Vec::new()
     } else if active.delta_needs_create {
-        create_or_open_targets(&delta_root, &active.delta, config)?
+        create_or_open_targets(&delta_root, &active.delta, delta_config)?
     } else {
-        open_optional_targets(&delta_root, &active.delta, config)?
+        open_optional_targets(&delta_root, &active.delta, delta_config)?
     };
     let mut delta_catalog = read_delta_catalog(index_dir)?;
     let mut delta_catalog_dirty = false;

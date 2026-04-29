@@ -12,6 +12,7 @@ use crate::term::fmt_size;
 const FALLBACK_FULL_REINDEX_MEMORY_MB: usize = 5048;
 const MAX_FULL_REINDEX_MEMORY_MB: usize = 8192;
 pub const DEFAULT_MAINTENANCE_MEMORY_MB: usize = 768;
+pub const DEFAULT_DELTA_MEMORY_MB: usize = 128;
 const MIN_WRITER_MEMORY_BYTES: usize = 15_000_000;
 const MAX_AUTO_WORKER_THREADS: usize = 8;
 
@@ -68,6 +69,15 @@ impl WriterConfig {
 
     pub fn for_incremental_update() -> Self {
         Self::default()
+    }
+
+    pub fn for_delta_update() -> Self {
+        Self {
+            memory_mb: DEFAULT_DELTA_MEMORY_MB,
+            worker_threads: Some(1),
+            merge_threads: 1,
+            merge_policy: MergePolicyMode::None,
+        }
     }
 }
 

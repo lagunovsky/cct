@@ -330,7 +330,7 @@ fn optimize_delta_compacts_append_segments() -> Result<()> {
         subindex_segment_count(&delta, IndexKind::Word)? > 1,
         "two append commits should create multiple delta word segments"
     );
-    assert!(optimize_delta(&fx.index_dir, WriterConfig::for_incremental_update())?.is_some());
+    assert!(optimize_delta(&fx.index_dir, WriterConfig::for_delta_update())?.is_some());
     assert_eq!(subindex_segment_count(&delta, IndexKind::Word)?, 1);
     assert_session(
         &fx.search("OPTDELTA", SearchMode::Auto),
