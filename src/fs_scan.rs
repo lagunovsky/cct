@@ -1,10 +1,11 @@
 //! Discovery of Claude Code project files: sessions, subagent logs, text-like tool results.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 /// What kind of source produced the file. Used for classification only;
 /// the index treats them uniformly.
@@ -65,85 +66,98 @@ pub fn collect_cct_layout(projects_dir: &Path) -> Result<Vec<DiscoveredFile>> {
     let mut out = if workers == 1 || project_dirs.len() <= 1 {
         let mut buf = Vec::new();
         for dir in &project_dirs {
-            collect_project(dir, &mut buf);
+            collect_project(dir, &mut buf)?;
         }
         buf
     } else {
         let chunk_size = project_dirs.len().div_ceil(workers).max(1);
-        std::thread::scope(|scope| {
+        std::thread::scope(|scope| -> Result<Vec<DiscoveredFile>> {
             let handles: Vec<_> = project_dirs
                 .chunks(chunk_size)
                 .map(|chunk| {
-                    scope.spawn(move || {
+                    scope.spawn(move || -> Result<Vec<DiscoveredFile>> {
                         let mut local = Vec::new();
                         for dir in chunk {
-                            collect_project(dir, &mut local);
+                            collect_project(dir, &mut local)?;
                         }
-                        local
+                        Ok(local)
                     })
                 })
                 .collect();
             let mut all = Vec::new();
             for h in handles {
-                all.extend(h.join().expect("scan worker panicked"));
+                let local = h.join().map_err(|_| anyhow!("scan worker panicked"))??;
+                all.extend(local);
             }
-            all
-        })
+            Ok(all)
+        })?
     };
 
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
 
-fn collect_project(project_path: &Path, out: &mut Vec<DiscoveredFile>) {
-    let Ok(entries) = fs::read_dir(project_path) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn collect_project(project_path: &Path, out: &mut Vec<DiscoveredFile>) -> Result<()> {
+    let entries = fs::read_dir(project_path)
+        .with_context(|| format!("read dir {}", project_path.display()))?;
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        let Ok(ty) = entry.file_type() else { continue };
+        let ty = entry.file_type()?;
         if ty.is_file() {
             if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                push_file(out, path, FileKind::SessionJsonl);
+                push_file(out, path, FileKind::SessionJsonl)?;
             }
         } else if ty.is_dir() {
-            collect_session_subdirs(&path, out);
+            collect_session_subdirs(&path, out)?;
         }
     }
+    Ok(())
 }
 
-fn collect_session_subdirs(session_dir: &Path, out: &mut Vec<DiscoveredFile>) {
-    if let Ok(entries) = fs::read_dir(session_dir.join("subagents")) {
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
+fn collect_session_subdirs(session_dir: &Path, out: &mut Vec<DiscoveredFile>) -> Result<()> {
+    let subagents = session_dir.join("subagents");
+    if let Some(entries) = read_optional_dir(&subagents)? {
+        for entry in entries {
+            let entry = entry?;
+            let ft = entry.file_type()?;
             if !ft.is_file() {
                 continue;
             }
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                push_file(out, p, FileKind::SubagentJsonl);
+                push_file(out, p, FileKind::SubagentJsonl)?;
             }
         }
     }
 
-    if let Ok(entries) = fs::read_dir(session_dir.join("tool-results")) {
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
+    let tool_results = session_dir.join("tool-results");
+    if let Some(entries) = read_optional_dir(&tool_results)? {
+        for entry in entries {
+            let entry = entry?;
+            let ft = entry.file_type()?;
             if !ft.is_file() {
                 continue;
             }
             let p = entry.path();
             if is_text_like_tool_result(&p) {
-                push_file(out, p, FileKind::ToolResult);
+                push_file(out, p, FileKind::ToolResult)?;
             }
         }
     }
+    Ok(())
 }
 
-fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) {
-    let Ok(meta) = fs::metadata(&path) else {
-        return;
-    };
+fn read_optional_dir(path: &Path) -> Result<Option<fs::ReadDir>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read dir {}", path.display())),
+    }
+}
+
+fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) -> Result<()> {
+    let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
     let mtime_ms = meta
         .modified()
         .ok()
@@ -156,6 +170,7 @@ fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) {
         size: meta.len(),
         mtime_ms,
     });
+    Ok(())
 }
 
 pub fn is_text_like_tool_result(path: &Path) -> bool {
