@@ -79,7 +79,12 @@ pub fn build_plan(
     })
 }
 
-pub fn run_update(index_dir: &Path, plan: UpdatePlan, config: WriterConfig) -> Result<UpdateStats> {
+pub fn run_update(
+    index_dir: &Path,
+    plan: UpdatePlan,
+    config: WriterConfig,
+    verbose: bool,
+) -> Result<UpdateStats> {
     if plan.enabled.is_empty() {
         bail!("no indexes enabled");
     }
@@ -95,13 +100,15 @@ pub fn run_update(index_dir: &Path, plan: UpdatePlan, config: WriterConfig) -> R
         .map(|k| k.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    eprintln!(
-        "Updating {} from {} [{}]",
-        index_dir.display(),
-        source.display(),
-        enabled_names,
-    );
-    print_writer_config(config, enabled.len());
+    if verbose {
+        eprintln!(
+            "Updating {} from {} [{}]",
+            index_dir.display(),
+            source.display(),
+            enabled_names,
+        );
+        print_writer_config(config, enabled.len());
+    }
 
     let mut targets = open_existing_targets(index_dir, &enabled, config)?;
     let start = Instant::now();
@@ -165,36 +172,46 @@ pub fn run_update(index_dir: &Path, plan: UpdatePlan, config: WriterConfig) -> R
         new_catalog.push(entry);
     }
 
-    eprintln!(
-        "  added {}, appended {}, reindexed {}, deleted {}, unchanged {}",
-        stats.added, stats.appended, stats.reindexed, stats.deleted, stats.unchanged
-    );
-    eprintln!(
-        "  read {}; indexed append/content {}; chunks {}",
-        fmt_size(stats.read_bytes),
-        fmt_size(stats.indexed_bytes),
-        stats.indexed_chunks
-    );
+    if verbose {
+        eprintln!(
+            "  added {}, appended {}, reindexed {}, deleted {}, unchanged {}",
+            stats.added, stats.appended, stats.reindexed, stats.deleted, stats.unchanged
+        );
+        eprintln!(
+            "  read {}; indexed append/content {}; chunks {}",
+            fmt_size(stats.read_bytes),
+            fmt_size(stats.indexed_bytes),
+            stats.indexed_chunks
+        );
+    }
 
     for target in &mut targets {
         let phase = Instant::now();
-        eprintln!("Committing {}...", target.kind.as_str());
+        if verbose {
+            eprintln!("Committing {}...", target.kind.as_str());
+        }
         target.writer.commit()?;
-        eprintln!(
-            "Committed {} in {:?}",
-            target.kind.as_str(),
-            phase.elapsed()
-        );
+        if verbose {
+            eprintln!(
+                "Committed {} in {:?}",
+                target.kind.as_str(),
+                phase.elapsed()
+            );
+        }
     }
     for target in targets {
         let phase = Instant::now();
-        eprintln!("Waiting merges for {}...", target.kind.as_str());
+        if verbose {
+            eprintln!("Waiting merges for {}...", target.kind.as_str());
+        }
         target.writer.wait_merging_threads()?;
-        eprintln!(
-            "Merges done for {} in {:?}",
-            target.kind.as_str(),
-            phase.elapsed()
-        );
+        if verbose {
+            eprintln!(
+                "Merges done for {} in {:?}",
+                target.kind.as_str(),
+                phase.elapsed()
+            );
+        }
     }
 
     let _catalog_path = write_catalog(index_dir, &new_catalog)?;
@@ -208,25 +225,27 @@ pub fn run_update(index_dir: &Path, plan: UpdatePlan, config: WriterConfig) -> R
         config,
     )?;
 
-    let total_index_bytes = dir_size(index_dir)?;
-    eprintln!(
-        "Done in {:?}; source bytes {}; total index bytes {} ({:.2}x source)",
-        start.elapsed(),
-        fmt_size(total_bytes),
-        fmt_size(total_index_bytes),
-        size_ratio(total_index_bytes, total_bytes),
-    );
-    for kind in &enabled {
-        let dir = subindex_dir(index_dir, *kind);
-        let size = dir_size(&dir)?;
-        let segments = subindex_segment_count(index_dir, *kind)?;
+    if verbose {
+        let total_index_bytes = dir_size(index_dir)?;
         eprintln!(
-            "  {:7} {} ({:.2}x source), segments {}",
-            kind.as_str(),
-            fmt_size(size),
-            size_ratio(size, total_bytes),
-            segments
+            "Done in {:?}; source bytes {}; total index bytes {} ({:.2}x source)",
+            start.elapsed(),
+            fmt_size(total_bytes),
+            fmt_size(total_index_bytes),
+            size_ratio(total_index_bytes, total_bytes),
         );
+        for kind in &enabled {
+            let dir = subindex_dir(index_dir, *kind);
+            let size = dir_size(&dir)?;
+            let segments = subindex_segment_count(index_dir, *kind)?;
+            eprintln!(
+                "  {:7} {} ({:.2}x source), segments {}",
+                kind.as_str(),
+                fmt_size(size),
+                size_ratio(size, total_bytes),
+                segments
+            );
+        }
     }
     Ok(stats)
 }

@@ -56,13 +56,20 @@ impl Fixture {
         let files = collect_cct_layout(&self.source)?;
         let enabled = IndexKind::all();
         let config = WriterConfig::for_full_reindex();
-        run_full_reindex(&self.source, &self.index_dir, &enabled, files, config)
+        run_full_reindex(
+            &self.source,
+            &self.index_dir,
+            &enabled,
+            files,
+            config,
+            false,
+        )
     }
 
     fn full_reindex_only(&self, kinds: BTreeSet<IndexKind>) -> Result<()> {
         let files = collect_cct_layout(&self.source)?;
         let config = WriterConfig::for_full_reindex();
-        run_full_reindex(&self.source, &self.index_dir, &kinds, files, config)
+        run_full_reindex(&self.source, &self.index_dir, &kinds, files, config, false)
     }
 
     fn update(&self) -> Result<()> {
@@ -72,6 +79,7 @@ impl Fixture {
             &self.index_dir,
             plan,
             WriterConfig::for_incremental_update(),
+            false,
         )?;
         Ok(())
     }

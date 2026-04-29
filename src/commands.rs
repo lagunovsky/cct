@@ -105,7 +105,7 @@ pub fn run_reindex(args: cli::ReindexCmd) -> Result<()> {
     let index_dir = index_root()?;
     let files = collect_cct_layout(&source)?;
     let start = Instant::now();
-    run_full_reindex(&source, &index_dir, &enabled, files, config)?;
+    run_full_reindex(&source, &index_dir, &enabled, files, config, true)?;
     eprintln!("Done in {:?}", start.elapsed());
     Ok(())
 }
@@ -126,7 +126,7 @@ pub fn run_update_cmd(args: cli::UpdateCmd) -> Result<()> {
         println!("Nothing to update.");
         return Ok(());
     }
-    run_update(&index_dir, plan, config)?;
+    run_update(&index_dir, plan, config, true)?;
     Ok(())
 }
 
@@ -175,7 +175,12 @@ pub fn run_silent_update(index_dir: &Path) -> Result<()> {
     if !needs_update(&plan) {
         return Ok(());
     }
-    run_update(index_dir, plan, WriterConfig::for_incremental_update())?;
+    run_update(
+        index_dir,
+        plan,
+        WriterConfig::for_incremental_update(),
+        false,
+    )?;
     Ok(())
 }
 
@@ -195,23 +200,49 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     let start = Instant::now();
     print_search_header(&query, &args, project_label.as_deref());
 
-    let sp = Spinner::start("indexing...");
+    let verbose_index = args.verbose >= 2;
     if !args.no_update {
         if !index_dir.exists() {
-            sp.set_message("building initial index — this may take a while");
+            eprintln!("{DIM}Building initial index — this may take a while...{RESET}");
             let config = WriterConfig::for_full_reindex();
             let files = collect_cct_layout(&source)?;
-            run_full_reindex(&source, &index_dir, &IndexKind::all(), files, config)?;
+            run_full_reindex(
+                &source,
+                &index_dir,
+                &IndexKind::all(),
+                files,
+                config,
+                verbose_index,
+            )?;
         } else {
+            let sp = Spinner::start("scanning sessions...");
             let files = collect_cct_layout(&source)?;
             let plan = build_plan(&index_dir, Some(source.clone()), files)?;
             if needs_update(&plan) {
-                sp.set_message("updating index...");
-                run_update(&index_dir, plan, WriterConfig::for_incremental_update())?;
+                if verbose_index {
+                    sp.stop();
+                    run_update(
+                        &index_dir,
+                        plan,
+                        WriterConfig::for_incremental_update(),
+                        true,
+                    )?;
+                } else {
+                    sp.set_message("updating index...");
+                    run_update(
+                        &index_dir,
+                        plan,
+                        WriterConfig::for_incremental_update(),
+                        false,
+                    )?;
+                    sp.stop();
+                }
+            } else {
+                sp.stop();
             }
         }
     }
-    sp.set_message("searching...");
+    let sp = Spinner::start("searching...");
 
     let mode = match args.mode {
         cli::SearchMode::Auto => search::SearchMode::Auto,
@@ -238,8 +269,8 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         for s in sessions.iter_mut().take(to_show) {
             let stats = compute_session_stats(s);
             search::print_session_header(s, stats.prompts, stats.tools, stats.bytes);
-            search::print_snippets(&s.snippets, &query, args.verbose);
-            if args.verbose {
+            search::print_snippets(&s.snippets, &query, args.verbose >= 1);
+            if args.verbose >= 1 {
                 for f in &s.files {
                     println!("  {DIM}{}{RESET}", f.display());
                 }

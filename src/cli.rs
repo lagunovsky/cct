@@ -20,35 +20,35 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Recent sessions in current project (default).
-    #[command(visible_alias ="r")]
+    #[command(visible_alias = "r")]
     Recent(RecentCmd),
 
     /// Full-text search across Claude Code sessions.
-    #[command(visible_alias ="s")]
+    #[command(visible_alias = "s")]
     Search(SearchCmd),
 
     /// Rebuild the search index from scratch.
-    #[command(visible_alias ="ri")]
+    #[command(visible_alias = "ri")]
     Reindex(ReindexCmd),
 
     /// Apply incremental updates (add new files, append-tail jsonl, drop removed).
-    #[command(visible_alias ="u")]
+    #[command(visible_alias = "u")]
     Update(UpdateCmd),
 
     /// Compact existing segments to reduce size and segment count.
-    #[command(visible_alias ="c")]
+    #[command(visible_alias = "c")]
     Compact(CompactCmd),
 
     /// Migrate a project's sessions when its directory is renamed/moved.
-    #[command(visible_alias ="rn")]
+    #[command(visible_alias = "rn")]
     Rename(RenameCmd),
 
     /// Move specific sessions between projects.
-    #[command(visible_alias ="mv")]
+    #[command(visible_alias = "mv")]
     Move(MoveCmd),
 
     /// Manage launchd background indexing (macOS).
-    #[command(visible_alias ="d")]
+    #[command(visible_alias = "d")]
     Daemon(DaemonCmd),
 }
 
@@ -69,9 +69,9 @@ pub struct SearchCmd {
     #[arg(short = 'c', long = "context", default_value_t = 120)]
     pub context: usize,
 
-    /// Show file paths and surface sub-agent / hook matches.
-    #[arg(short, long, default_value_t = false)]
-    pub verbose: bool,
+    /// Verbose: -v shows file paths + agent/hook matches; -vv also shows index update phases.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
 
     /// Search across all projects (default: current directory only).
     #[arg(short, long, default_value_t = false)]

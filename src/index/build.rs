@@ -39,6 +39,7 @@ pub fn run_full_reindex(
     enabled: &BTreeSet<IndexKind>,
     files: Vec<DiscoveredFile>,
     config: WriterConfig,
+    verbose: bool,
 ) -> Result<()> {
     if !source.is_dir() {
         bail!("source dir does not exist: {}", source.display());
@@ -59,14 +60,16 @@ pub fn run_full_reindex(
         .map(|k| k.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    eprintln!(
-        "Indexing {} files from {} into {} [{}]",
-        files.len(),
-        source.display(),
-        index_dir.display(),
-        enabled_names,
-    );
-    print_writer_config(config, enabled.len());
+    if verbose {
+        eprintln!(
+            "Indexing {} files from {} into {} [{}]",
+            files.len(),
+            source.display(),
+            index_dir.display(),
+            enabled_names,
+        );
+        print_writer_config(config, enabled.len());
+    }
 
     let mut targets = Vec::new();
     for kind in enabled {
@@ -93,7 +96,9 @@ pub fn run_full_reindex(
         let (entry, chunks) = match add_whole_file(&mut targets, file, file_id as u64) {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("  skipped {}: {err:#}", file.path.display());
+                if verbose {
+                    eprintln!("  skipped {}: {err:#}", file.path.display());
+                }
                 continue;
             }
         };
@@ -101,63 +106,75 @@ pub fn run_full_reindex(
         total_bytes += entry.size;
         indexed_chunks += chunks;
         catalog_entries.push(entry);
-        if indexed % 500 == 0 {
+        if verbose && indexed % 500 == 0 {
             eprint!("\r  {indexed} indexed");
         }
     }
-    eprintln!("\r  {indexed} indexed");
-    eprintln!(
-        "Added documents in {:?}; content chunks {}",
-        add_start.elapsed(),
-        indexed_chunks
-    );
+    if verbose {
+        eprintln!("\r  {indexed} indexed");
+        eprintln!(
+            "Added documents in {:?}; content chunks {}",
+            add_start.elapsed(),
+            indexed_chunks
+        );
+    }
     let catalog_path = write_catalog(index_dir, &catalog_entries)?;
 
     for target in &mut targets {
         let phase = Instant::now();
-        eprintln!("Committing {}...", target.kind.as_str());
+        if verbose {
+            eprintln!("Committing {}...", target.kind.as_str());
+        }
         target.writer.commit()?;
-        eprintln!(
-            "Committed {} in {:?}",
-            target.kind.as_str(),
-            phase.elapsed()
-        );
+        if verbose {
+            eprintln!(
+                "Committed {} in {:?}",
+                target.kind.as_str(),
+                phase.elapsed()
+            );
+        }
     }
     for target in targets {
         let phase = Instant::now();
-        eprintln!("Waiting merges for {}...", target.kind.as_str());
+        if verbose {
+            eprintln!("Waiting merges for {}...", target.kind.as_str());
+        }
         target.writer.wait_merging_threads()?;
-        eprintln!(
-            "Merges done for {} in {:?}",
-            target.kind.as_str(),
-            phase.elapsed()
-        );
+        if verbose {
+            eprintln!(
+                "Merges done for {} in {:?}",
+                target.kind.as_str(),
+                phase.elapsed()
+            );
+        }
     }
 
     write_manifest(index_dir, source, indexed, total_bytes, enabled, config)?;
 
-    let elapsed = start.elapsed();
-    let total_index_bytes = dir_size(index_dir)?;
-    eprintln!(
-        "Done in {:?}; source bytes {}; total index bytes {} ({:.2}x source)",
-        elapsed,
-        fmt_size(total_bytes),
-        fmt_size(total_index_bytes),
-        size_ratio(total_index_bytes, total_bytes),
-    );
-    for kind in enabled {
-        let dir = subindex_dir(index_dir, *kind);
-        let size = dir_size(&dir)?;
-        let segments = subindex_segment_count(index_dir, *kind)?;
+    if verbose {
+        let elapsed = start.elapsed();
+        let total_index_bytes = dir_size(index_dir)?;
         eprintln!(
-            "  {:7} {} ({:.2}x source), segments {}",
-            kind.as_str(),
-            fmt_size(size),
-            size_ratio(size, total_bytes),
-            segments
+            "Done in {:?}; source bytes {}; total index bytes {} ({:.2}x source)",
+            elapsed,
+            fmt_size(total_bytes),
+            fmt_size(total_index_bytes),
+            size_ratio(total_index_bytes, total_bytes),
         );
+        for kind in enabled {
+            let dir = subindex_dir(index_dir, *kind);
+            let size = dir_size(&dir)?;
+            let segments = subindex_segment_count(index_dir, *kind)?;
+            eprintln!(
+                "  {:7} {} ({:.2}x source), segments {}",
+                kind.as_str(),
+                fmt_size(size),
+                size_ratio(size, total_bytes),
+                segments
+            );
+        }
+        eprintln!("  catalog {}", catalog_path.display());
     }
-    eprintln!("  catalog {}", catalog_path.display());
     Ok(())
 }
 
