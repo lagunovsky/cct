@@ -512,6 +512,41 @@ fn snippets_come_from_chunk_offsets() -> Result<()> {
 }
 
 #[test]
+fn slash_command_invocation_is_searchable_by_command_name() -> Result<()> {
+    let fx = Fixture::new()?;
+    fx.write_session(
+        "session-slash-command",
+        &format!(
+            "{}\n",
+            jsonl_user(
+                "<command-message>/research anomaly budgets</command-message>\
+                 <command-args>anomaly budgets</command-args>\
+                 <command-name>/research</command-name>"
+            ),
+        ),
+    );
+    fx.full_reindex()?;
+
+    let results = fx.search("/research", SearchMode::Auto);
+    assert_session(&results, "session-slash-command");
+    let combined = results[0]
+        .snippets
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        combined.contains("/research anomaly budgets"),
+        "expected rewritten slash command snippet: {combined}"
+    );
+    assert!(
+        !combined.contains("<command-name>"),
+        "snippet should not show raw command tags: {combined}"
+    );
+    Ok(())
+}
+
+#[test]
 fn unicode_lowercase_expansion_does_not_panic_snippets() -> Result<()> {
     let fx = Fixture::new()?;
     fx.write_session(

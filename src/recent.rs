@@ -11,7 +11,7 @@ use serde_json::Value as JsonValue;
 
 use crate::path_codec::{encode_project_dir, projects_dir};
 use crate::term::{fmt_size, BOLD, CYAN, DIM, GREEN, RESET};
-use crate::text::{is_meta_content, last_message_time_ms};
+use crate::text::{is_meta_content, last_message_time_ms, rewrite_slash_command};
 
 pub struct RecentOptions {
     pub limit: usize,
@@ -198,9 +198,11 @@ fn parse_recent_entry(line: &str) -> Option<(Option<String>, Option<String>, u32
     let (role, text) = match msg_type {
         "user" => {
             let text = extract_user_text(obj.get("message"))?;
-            if is_meta_content(&text) {
-                return Some((None, None, tools));
-            }
+            let text = match rewrite_slash_command(&text) {
+                Some(rewritten) => rewritten,
+                None if is_meta_content(&text) => return Some((None, None, tools)),
+                None => text,
+            };
             (Some("user".to_string()), Some(text))
         }
         "assistant" => {
@@ -359,9 +361,11 @@ pub fn first_user_prompt(path: &Path) -> Option<String> {
             continue;
         }
         if let Some(text) = extract_user_text(obj.get("message")) {
-            if is_meta_content(&text) {
-                continue;
-            }
+            let text = match rewrite_slash_command(&text) {
+                Some(rewritten) => rewritten,
+                None if is_meta_content(&text) => continue,
+                None => text,
+            };
             return Some(collapse_spaces(&text));
         }
     }

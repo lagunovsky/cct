@@ -15,6 +15,7 @@ use crate::path_codec::parse_file_path;
 use crate::term::{fmt_size, highlight, CYAN, DIM, GRAY, RESET};
 use crate::text::{
     classify_line, extract_top_level_timestamp_ms, find_json_values, is_meta_content,
+    rewrite_slash_command,
 };
 
 use super::build::{read_file_range, stored_string, stored_u64};
@@ -251,7 +252,19 @@ fn snippets_for_hits(
         }
         tokens
     } else {
-        vec![query.to_string()]
+        let mut n = vec![query.to_string()];
+        // Word index tokenizes "/research" as ["research"], so a doc may match
+        // without the literal slash being on any single line (e.g. a Claude
+        // slash command mentioned as plain "research"). For single-token
+        // queries wrapped in non-word punctuation, accept the bare token too.
+        let tokens: Vec<&str> = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| t.chars().count() >= 2)
+            .collect();
+        if tokens.len() == 1 && tokens[0] != query {
+            n.push(tokens[0].to_string());
+        }
+        n
     };
     let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
     let mut budget = 6usize;
@@ -347,9 +360,11 @@ fn extract_all_snippets(
 
     let mut results: Vec<String> = Vec::new();
     'outer: for value in values {
-        if is_meta_content(&value) {
-            continue;
-        }
+        let value = match rewrite_slash_command(&value) {
+            Some(rewritten) => rewritten,
+            None if is_meta_content(&value) => continue,
+            None => value,
+        };
         let (lower, spans) = lowercase_with_spans(&value);
         let mut search_from = 0usize;
         while results.len() < max_count {
@@ -664,7 +679,17 @@ pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool, fuzzy: b
             .map(|s| s.to_string())
             .collect()
     } else {
-        Vec::new()
+        // Mirror the needle-expansion in `snippets_for_hits`: when "/research"
+        // matches lines via the bare "research" token, highlight that too.
+        let tokens: Vec<&str> = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| t.chars().count() >= 2)
+            .collect();
+        if tokens.len() == 1 && tokens[0] != query {
+            vec![query.to_string(), tokens[0].to_string()]
+        } else {
+            Vec::new()
+        }
     };
     let token_refs: Vec<&str> = token_strings.iter().map(|s| s.as_str()).collect();
 
@@ -683,7 +708,7 @@ pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool, fuzzy: b
         } else {
             String::new()
         };
-        let highlighted = if fuzzy && !token_refs.is_empty() {
+        let highlighted = if !token_refs.is_empty() {
             highlight_any(&s.text, &token_refs)
         } else {
             highlight(&s.text, query)

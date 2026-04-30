@@ -81,7 +81,7 @@ fn count_stats(obj: &serde_json::Map<String, JsonValue>, stats: &mut SessionStat
                     match (ct, msg_type) {
                         ("text", "user") => {
                             let text = block_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                            if !is_meta_content(text) {
+                            if rewrite_slash_command(text).is_some() || !is_meta_content(text) {
                                 stats.prompts = stats.prompts.saturating_add(1);
                             }
                         }
@@ -96,7 +96,7 @@ fn count_stats(obj: &serde_json::Map<String, JsonValue>, stats: &mut SessionStat
                 }
             }
             JsonValue::String(s) if msg_type == "user" => {
-                if !is_meta_content(s) {
+                if rewrite_slash_command(s).is_some() || !is_meta_content(s) {
                     stats.prompts = stats.prompts.saturating_add(1);
                 }
             }
@@ -194,6 +194,26 @@ pub fn is_meta_content(s: &str) -> bool {
         "<user-prompt-submit-hook>",
     ];
     PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
+/// Collapse a `<command-message>…</command-message><command-name>/foo</command-name><command-args>…</command-args>`
+/// block (any tag order, whitespace-separated) into the human form `/foo …`.
+/// Returns `None` when the input is not a slash-command invocation.
+pub fn rewrite_slash_command(s: &str) -> Option<String> {
+    fn extract<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let start = s.find(&open)? + open.len();
+        let end = s[start..].find(&close)? + start;
+        Some(s[start..end].trim())
+    }
+    let name = extract(s, "command-name")?;
+    let args = extract(s, "command-args").unwrap_or("");
+    if args.is_empty() {
+        Some(name.to_string())
+    } else {
+        Some(format!("{name} {args}"))
+    }
 }
 
 /// Walk an arbitrary JSON value and collect all string values containing `query` (lowercased).
