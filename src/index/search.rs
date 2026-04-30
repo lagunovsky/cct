@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 use tantivy::collector::TopDocs;
@@ -181,9 +182,16 @@ fn build_session_results(
     fuzzy: bool,
 ) -> BTreeMap<String, SessionResult> {
     const MAX_SNIPPETS_PER_SESSION: usize = 10;
-    let mut by_session: BTreeMap<String, SessionResult> = BTreeMap::new();
 
-    for (path, hits) in by_file {
+    // Phase 1 — generate snippets per file in parallel. Each `(path, hits)`
+    // entry is independent: it does its own disk read + JSON parse + scan.
+    // With many matched files this is the dominant cost; the merge in phase 2
+    // is cheap and stays single-threaded to preserve dedup/cap semantics.
+    let entries: Vec<(PathBuf, Vec<DocHit>)> = by_file.into_iter().collect();
+    let snippets = generate_snippets_parallel(&entries, query, context_chars, fuzzy);
+
+    let mut by_session: BTreeMap<String, SessionResult> = BTreeMap::new();
+    for ((path, _hits), file_snippets) in entries.into_iter().zip(snippets.into_iter()) {
         let (session_id, project, source) = parse_file_path(&path);
         let entry = by_session
             .entry(session_id.clone())
@@ -201,8 +209,7 @@ fn build_session_results(
             entry.project = project;
         }
 
-        let snippets = snippets_for_hits(&path, &hits, query, context_chars, fuzzy);
-        for s in snippets {
+        for s in file_snippets {
             if entry.snippets.len() >= MAX_SNIPPETS_PER_SESSION {
                 break;
             }
@@ -230,6 +237,63 @@ fn build_session_results(
         }
     }
     by_session
+}
+
+fn generate_snippets_parallel(
+    entries: &[(PathBuf, Vec<DocHit>)],
+    query: &str,
+    context_chars: usize,
+    fuzzy: bool,
+) -> Vec<Vec<Snippet>> {
+    let n = entries.len();
+    if n <= 1 {
+        return entries
+            .iter()
+            .map(|(p, h)| snippets_for_hits(p, h, query, context_chars, fuzzy))
+            .collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(n)
+        .max(1);
+    if workers == 1 {
+        return entries
+            .iter()
+            .map(|(p, h)| snippets_for_hits(p, h, query, context_chars, fuzzy))
+            .collect();
+    }
+
+    let mut out: Vec<Vec<Snippet>> = (0..n).map(|_| Vec::new()).collect();
+    let counter = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let counter = &counter;
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(move || -> Vec<(usize, Vec<Snippet>)> {
+                let mut local = Vec::new();
+                loop {
+                    let i = counter.fetch_add(1, Ordering::Relaxed);
+                    if i >= entries.len() {
+                        break;
+                    }
+                    let (path, hits) = &entries[i];
+                    local.push((i, snippets_for_hits(path, hits, query, context_chars, fuzzy)));
+                }
+                local
+            }));
+        }
+        for h in handles {
+            // Propagate worker panics rather than silently dropping the slot —
+            // empty results would otherwise look like a session with no matches.
+            let local = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            for (i, s) in local {
+                out[i] = s;
+            }
+        }
+    });
+    out
 }
 
 fn snippets_for_hits(

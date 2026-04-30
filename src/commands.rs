@@ -285,8 +285,12 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     if to_show == 0 {
         println!("\n{DIM}No matches found{RESET}");
     } else {
-        for s in sessions.iter_mut().take(to_show) {
-            let stats = compute_session_stats(s);
+        // Precompute stats in parallel — each session's stats require reading
+        // and parsing its full JSONL, which is the dominant render cost when
+        // many sessions match.
+        let visible: Vec<&search::SessionResult> = sessions.iter().take(to_show).collect();
+        let stats_per_session = compute_session_stats_parallel(&visible);
+        for (s, stats) in sessions.iter_mut().take(to_show).zip(stats_per_session) {
             search::print_session_header(s, stats.prompts, stats.tools, stats.bytes);
             search::print_snippets(&s.snippets, &query, args.verbose >= 1, args.fuzzy);
             if args.verbose >= 1 {
@@ -423,5 +427,50 @@ fn compute_session_stats(session: &search::SessionResult) -> DisplayStats {
             out.tools = out.tools.max(stats.tools);
         }
     }
+    out
+}
+
+fn compute_session_stats_parallel(sessions: &[&search::SessionResult]) -> Vec<DisplayStats> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n = sessions.len();
+    if n <= 1 {
+        return sessions.iter().map(|s| compute_session_stats(s)).collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(n)
+        .max(1);
+    if workers == 1 {
+        return sessions.iter().map(|s| compute_session_stats(s)).collect();
+    }
+    let mut out: Vec<DisplayStats> = vec![DisplayStats::default(); n];
+    let counter = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let counter = &counter;
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(move || -> Vec<(usize, DisplayStats)> {
+                let mut local = Vec::new();
+                loop {
+                    let i = counter.fetch_add(1, Ordering::Relaxed);
+                    if i >= sessions.len() {
+                        break;
+                    }
+                    local.push((i, compute_session_stats(sessions[i])));
+                }
+                local
+            }));
+        }
+        for h in handles {
+            // Propagate worker panics — an empty DisplayStats would silently
+            // show 0 prompts/0 tools/0 bytes for an affected session.
+            let local = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            for (i, s) in local {
+                out[i] = s;
+            }
+        }
+    });
     out
 }
