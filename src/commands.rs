@@ -31,7 +31,7 @@ pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
         Some(cli::Cmd::Update(args)) => run_update_cmd(args),
         Some(cli::Cmd::Compact(args)) => run_compact_cmd(args),
         Some(cli::Cmd::Rename(args)) => run_rename(args),
-        Some(cli::Cmd::Move(args)) => run_move(args),
+        Some(cli::Cmd::Transfer(args)) => run_transfer(args),
         Some(cli::Cmd::Daemon(args)) => match args.action {
             cli::DaemonAction::Install => crate::daemon::install_daemon(),
             cli::DaemonAction::Uninstall => crate::daemon::uninstall_daemon(),
@@ -149,13 +149,13 @@ pub fn run_rename(args: cli::RenameCmd) -> Result<()> {
     crate::rename::rename_project(crate::rename::RenameArgs {
         old_arg,
         new_arg,
-        move_dir: args.move_dir,
+        move_dir: !args.no_move_dir,
         dry_run: args.dry_run,
     })
 }
 
-pub fn run_move(args: cli::MoveCmd) -> Result<()> {
-    crate::move_cmd::run_move(crate::move_cmd::MoveArgs {
+pub fn run_transfer(args: cli::TransferCmd) -> Result<()> {
+    crate::transfer::run_transfer(crate::transfer::TransferArgs {
         target: args.target,
         from: args.from,
         session_args: args.session_ids,

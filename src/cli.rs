@@ -39,13 +39,13 @@ pub enum Cmd {
     #[command(visible_alias = "c")]
     Compact(CompactCmd),
 
-    /// Migrate a project's sessions when its directory is renamed/moved.
+    /// Rename a project: physically move the directory and migrate all its sessions.
     #[command(visible_alias = "rn")]
     Rename(RenameCmd),
 
-    /// Move specific sessions between projects.
-    #[command(visible_alias = "mv")]
-    Move(MoveCmd),
+    /// Transfer specific sessions between projects.
+    #[command(visible_alias = "tr")]
+    Transfer(TransferCmd),
 
     /// Manage launchd background indexing (macOS).
     #[command(visible_alias = "d")]
@@ -151,9 +151,11 @@ pub struct CompactCmd {
 
 #[derive(Args, Debug)]
 pub struct RenameCmd {
-    /// Also rename the project directory itself.
-    #[arg(long = "move-dir", default_value_t = false)]
-    pub move_dir: bool,
+    /// Skip physically renaming the project directory (use when the dir was
+    /// already renamed/moved on disk and only the session jsonl-s need cwd
+    /// rewiring).
+    #[arg(long = "no-move-dir", default_value_t = false)]
+    pub no_move_dir: bool,
     /// Show what would change but don't write.
     #[arg(long = "dry-run", default_value_t = false)]
     pub dry_run: bool,
@@ -164,7 +166,7 @@ pub struct RenameCmd {
 }
 
 #[derive(Args, Debug)]
-pub struct MoveCmd {
+pub struct TransferCmd {
     /// Source project path. Defaults to cwd.
     #[arg(long = "from")]
     pub from: Option<String>,

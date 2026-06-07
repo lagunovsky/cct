@@ -1,16 +1,16 @@
-//! Workflow tests for `cct rename` and `cct move`.
+//! Workflow tests for `cct rename` and `cct transfer`.
 //!
 //! Both functions normally read `~/.claude/projects/`. The `*_in` variants in
-//! `cct::rename` / `cct::move_cmd` accept an explicit `projects` directory so
+//! `cct::rename` / `cct::transfer` accept an explicit `projects` directory so
 //! these tests can drive everything inside a tempdir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use cct::move_cmd::move_sessions_in;
 use cct::path_codec::encode_project_dir;
 use cct::rename::{rename_project_in, RenameArgs};
+use cct::transfer::transfer_sessions_in;
 
 struct WorkspaceFixture {
     _tmp: tempfile::TempDir,
@@ -217,7 +217,7 @@ fn rename_refuses_when_target_session_dir_exists() -> Result<()> {
 }
 
 #[test]
-fn move_relocates_jsonl_and_rewrites_cwd() -> Result<()> {
+fn transfer_relocates_jsonl_and_rewrites_cwd() -> Result<()> {
     let fx = WorkspaceFixture::new()?;
     let src = fx.make_project(
         "src",
@@ -226,7 +226,7 @@ fn move_relocates_jsonl_and_rewrites_cwd() -> Result<()> {
     let dst = fx.work.join("dst");
     fs::create_dir_all(&dst)?;
 
-    move_sessions_in(&["aaaa1111".to_string()], &src, &dst, false, &fx.projects)?;
+    transfer_sessions_in(&["aaaa1111".to_string()], &src, &dst, false, &fx.projects)?;
 
     let src_sess = fx.session_dir_for(&src);
     let dst_sess = fx.session_dir_for(&dst);
@@ -250,7 +250,7 @@ fn move_relocates_jsonl_and_rewrites_cwd() -> Result<()> {
 }
 
 #[test]
-fn move_carries_subdirs_and_rewrites_their_files() -> Result<()> {
+fn transfer_carries_subdirs_and_rewrites_their_files() -> Result<()> {
     let fx = WorkspaceFixture::new()?;
     let src = fx.make_project("src2", &[("ccc33333", "with subdir")])?;
     let dst = fx.work.join("dst2");
@@ -265,7 +265,7 @@ fn move_carries_subdirs_and_rewrites_their_files() -> Result<()> {
     );
     fs::write(subdir.join("trace.log"), &tool_payload)?;
 
-    move_sessions_in(&["ccc33333".to_string()], &src, &dst, false, &fx.projects)?;
+    transfer_sessions_in(&["ccc33333".to_string()], &src, &dst, false, &fx.projects)?;
 
     let dst_sess = fx.session_dir_for(&dst);
     let new_log = dst_sess
@@ -290,13 +290,13 @@ fn move_carries_subdirs_and_rewrites_their_files() -> Result<()> {
 }
 
 #[test]
-fn move_dry_run_changes_nothing() -> Result<()> {
+fn transfer_dry_run_changes_nothing() -> Result<()> {
     let fx = WorkspaceFixture::new()?;
     let src = fx.make_project("dryrun-src", &[("ddd44444", "dry run target")])?;
     let dst = fx.work.join("dryrun-dst");
     fs::create_dir_all(&dst)?;
 
-    move_sessions_in(&["ddd44444".to_string()], &src, &dst, true, &fx.projects)?;
+    transfer_sessions_in(&["ddd44444".to_string()], &src, &dst, true, &fx.projects)?;
 
     let src_sess = fx.session_dir_for(&src);
     let dst_sess = fx.session_dir_for(&dst);
@@ -312,11 +312,11 @@ fn move_dry_run_changes_nothing() -> Result<()> {
 }
 
 #[test]
-fn move_into_same_project_is_an_error() -> Result<()> {
+fn transfer_into_same_project_is_an_error() -> Result<()> {
     let fx = WorkspaceFixture::new()?;
     let p = fx.make_project("same", &[("eee55555", "x")])?;
 
-    let res = move_sessions_in(
+    let res = transfer_sessions_in(
         &["eee55555".to_string()],
         &p,
         &p.join("."),

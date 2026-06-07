@@ -1,4 +1,4 @@
-//! `cct move` — move specific sessions between projects.
+//! `cct transfer` — transfer specific sessions between projects.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use crate::recent::{first_user_prompt, session_activity_time_ms};
 use crate::rename::{count_overlapping, replace_in_file};
 use crate::term::{fmt_size, BOLD, CYAN, DIM, GREEN, RED, RESET};
 
-pub struct MoveArgs {
+pub struct TransferArgs {
     pub target: String,
     pub from: Option<String>,
     pub session_args: Vec<String>,
@@ -21,7 +21,7 @@ pub struct MoveArgs {
     pub skip_confirm: bool,
 }
 
-pub fn run_move(args: MoveArgs) -> Result<()> {
+pub fn run_transfer(args: TransferArgs) -> Result<()> {
     let src_str = args.from.unwrap_or_else(|| ".".to_string());
     let src_abs = absolutize_lexical(&src_str)?;
     let dst_abs = absolutize_lexical(&args.target)?;
@@ -46,7 +46,7 @@ pub fn run_move(args: MoveArgs) -> Result<()> {
 
     if !args.dry_run && !skip_confirm {
         let prompt = format!(
-            "Move {} session(s) to {}? [y/N]: ",
+            "Transfer {} session(s) to {}? [y/N]: ",
             ids.len(),
             dst_abs.display()
         );
@@ -56,7 +56,7 @@ pub fn run_move(args: MoveArgs) -> Result<()> {
         }
     }
 
-    move_sessions(&ids, &src_abs, &dst_abs, args.dry_run)
+    transfer_sessions(&ids, &src_abs, &dst_abs, args.dry_run)
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +168,7 @@ fn resolve_session_id(src_dir: &Path, q: &str) -> Result<String> {
     }
 }
 
-struct PendingMove {
+struct PendingTransfer {
     id: String,
     src_jsonl: PathBuf,
     dst_jsonl: PathBuf,
@@ -178,14 +178,14 @@ struct PendingMove {
     replacements: usize,
 }
 
-fn move_sessions(ids: &[String], src_abs: &Path, dst_abs: &Path, dry_run: bool) -> Result<()> {
+fn transfer_sessions(ids: &[String], src_abs: &Path, dst_abs: &Path, dry_run: bool) -> Result<()> {
     let projects = projects_dir()?;
-    move_sessions_in(ids, src_abs, dst_abs, dry_run, &projects)
+    transfer_sessions_in(ids, src_abs, dst_abs, dry_run, &projects)
 }
 
 /// Test-friendly variant: caller supplies the projects directory so tests can
-/// exercise move/dry-run/cwd-rewrite logic in a tempdir.
-pub fn move_sessions_in(
+/// exercise transfer/dry-run/cwd-rewrite logic in a tempdir.
+pub fn transfer_sessions_in(
     ids: &[String],
     src_abs: &Path,
     dst_abs: &Path,
@@ -210,7 +210,7 @@ pub fn move_sessions_in(
     let src_bytes = src_abs.to_string_lossy().as_bytes().to_vec();
     let dst_bytes = dst_abs.to_string_lossy().as_bytes().to_vec();
 
-    let mut pending: Vec<PendingMove> = Vec::new();
+    let mut pending: Vec<PendingTransfer> = Vec::new();
     for raw in ids {
         let id = resolve_session_id(&src_dir, raw)?;
         let src_jsonl = src_dir.join(format!("{id}.jsonl"));
@@ -238,7 +238,7 @@ pub fn move_sessions_in(
             })?;
         }
 
-        pending.push(PendingMove {
+        pending.push(PendingTransfer {
             id,
             src_jsonl,
             dst_jsonl,
@@ -249,7 +249,7 @@ pub fn move_sessions_in(
         });
     }
 
-    println!("{BOLD}Move {} session(s):{RESET}", pending.len());
+    println!("{BOLD}Transfer {} session(s):{RESET}", pending.len());
     println!("  from: {}", src_abs.display());
     println!("  to:   {}", dst_abs.display());
     for p in &pending {
@@ -266,7 +266,7 @@ pub fn move_sessions_in(
 
     fs::create_dir_all(&dst_dir).with_context(|| "mkdir target")?;
 
-    let mut moved: Vec<PendingMove> = Vec::new();
+    let mut moved: Vec<PendingTransfer> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     for p in pending {
         if let Err(err) = fs::rename(&p.src_jsonl, &p.dst_jsonl) {
@@ -303,7 +303,7 @@ pub fn move_sessions_in(
     }
 
     println!(
-        "\n{GREEN}Done.{RESET} Moved {}/{} session(s).",
+        "\n{GREEN}Done.{RESET} Transferred {}/{} session(s).",
         moved.len(),
         moved.len() + failed.len()
     );
