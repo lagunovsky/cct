@@ -58,7 +58,7 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
         );
         return Ok(());
     }
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
     let limit = opts.limit.min(files.len());
 
     println!("{BOLD}Recent sessions in:{RESET} {cwd_str}");
@@ -106,13 +106,11 @@ pub fn session_activity_time_ms(path: &Path) -> i64 {
     };
     let total = meta.len();
     let mut data = Vec::new();
-    if total > TAIL {
-        if f.seek(SeekFrom::Start(total - TAIL)).is_ok() {
-            let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_ok() {
-                if let Some(nl) = buf.iter().position(|b| *b == b'\n') {
-                    data = buf[nl + 1..].to_vec();
-                }
+    if total > TAIL && f.seek(SeekFrom::Start(total - TAIL)).is_ok() {
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_ok() {
+            if let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+                data = buf[nl + 1..].to_vec();
             }
         }
     }
@@ -155,12 +153,12 @@ fn load_session_summary(path: &Path, n: usize) -> Result<(Vec<PromptPair>, u32, 
             continue;
         }
         let mut response = String::new();
-        for j in i + 1..entries.len() {
-            if entries[j].0 == "user" {
+        for (role, response_text) in entries.iter().skip(i + 1) {
+            if role == "user" {
                 break;
             }
-            if entries[j].0 == "assistant" && !entries[j].1.is_empty() {
-                response = entries[j].1.clone();
+            if role == "assistant" && !response_text.is_empty() {
+                response = response_text.clone();
                 break;
             }
         }
@@ -313,14 +311,12 @@ fn print_session_summary(
 
 fn trunc_runes(s: &str, n: usize) -> String {
     let mut out = String::new();
-    let mut count = 0usize;
-    for ch in s.chars() {
+    for (count, ch) in s.chars().enumerate() {
         if count >= n {
             out.push_str("...");
             return out;
         }
         out.push(ch);
-        count += 1;
     }
     out
 }

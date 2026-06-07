@@ -431,7 +431,7 @@ fn remove_delta_catalog(index_dir: &Path) -> Result<()> {
     match fs::remove_dir_all(&root) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).map_err(Into::into),
+        Err(err) => Err(Into::into(err)),
     }
 }
 

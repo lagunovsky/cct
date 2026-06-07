@@ -95,10 +95,11 @@ fn count_stats(obj: &serde_json::Map<String, JsonValue>, stats: &mut SessionStat
                     }
                 }
             }
-            JsonValue::String(s) if msg_type == "user" => {
-                if rewrite_slash_command(s).is_some() || !is_meta_content(s) {
-                    stats.prompts = stats.prompts.saturating_add(1);
-                }
+            JsonValue::String(s)
+                if msg_type == "user"
+                    && (rewrite_slash_command(s).is_some() || !is_meta_content(s)) =>
+            {
+                stats.prompts = stats.prompts.saturating_add(1);
             }
             _ => {}
         }

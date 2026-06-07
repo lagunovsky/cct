@@ -113,7 +113,7 @@ pub fn run_full_reindex(
         total_bytes += entry.size;
         indexed_chunks += chunks;
         catalog_entries.push(entry);
-        if verbose && indexed % 500 == 0 {
+        if verbose && indexed.is_multiple_of(500) {
             eprint!("\r  {indexed} indexed");
         }
     }

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::Result;
 use tantivy::schema::{
@@ -40,13 +41,21 @@ impl IndexKind {
             .collect()
     }
 
-    pub fn from_str(raw: &str) -> Option<Self> {
+    fn parse(raw: &str) -> Option<Self> {
         match raw.trim() {
             "word" => Some(IndexKind::Word),
             "trigram" => Some(IndexKind::Trigram),
             "path" => Some(IndexKind::Path),
             _ => None,
         }
+    }
+}
+
+impl FromStr for IndexKind {
+    type Err = ();
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse(raw).ok_or(())
     }
 }
 

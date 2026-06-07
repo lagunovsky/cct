@@ -20,7 +20,7 @@ use crate::text::{
 };
 
 use super::build::{read_file_range, stored_string, stored_u64};
-use super::catalog::{read_catalog, CatalogDisplayStats};
+use super::catalog::{catalog_path, read_catalog, CatalogDisplayStats};
 use super::schema::{
     delta_dir, fields_from_schema, register_tokenizers, subindex_dir, IndexKind, NGRAM_TOKENIZER,
     WORD_TOKENIZER,
@@ -142,19 +142,13 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     let roots = [index_dir.to_path_buf(), delta];
     for root in roots {
         for kind in &kinds {
-            if !subindex_dir(&root, *kind).exists() {
+            let dir = subindex_dir(&root, *kind);
+            if !dir.exists() {
                 continue;
             }
-            match search_one_index(
-                &root,
-                *kind,
-                &opts.query,
-                project_id.as_deref(),
-                limit,
-            ) {
-                Ok(rows) => hits.extend(rows),
-                Err(err) => eprintln!("  warning: {} search failed: {err:#}", kind.as_str()),
-            }
+            let rows = search_one_index(&root, *kind, &opts.query, project_id.as_deref(), limit)
+                .with_context(|| format!("search {} index at {}", kind.as_str(), dir.display()))?;
+            hits.extend(rows);
         }
     }
 
@@ -163,7 +157,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     }
 
     let groups = group_hits_by_file(hits);
-    let catalog_stats = load_catalog_display_stats(index_dir);
+    let catalog_stats = load_catalog_display_stats(index_dir)?;
     let by_session = build_session_results(
         groups,
         &opts.query,
@@ -173,7 +167,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     );
 
     let mut sessions: Vec<SessionResult> = by_session.into_values().collect();
-    sessions.sort_by(|a, b| b.last_msg_ms.cmp(&a.last_msg_ms));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_msg_ms));
     Ok(sessions)
 }
 
@@ -213,7 +207,7 @@ fn build_session_results(
     let snippets = generate_snippets_parallel(&entries, query, context_chars, fuzzy);
 
     let mut by_session: BTreeMap<String, SessionResult> = BTreeMap::new();
-    for ((path, _hits), file_snippets) in entries.into_iter().zip(snippets.into_iter()) {
+    for ((path, _hits), file_snippets) in entries.into_iter().zip(snippets) {
         let (session_id, project, source) = parse_file_path(&path);
         let entry = by_session
             .entry(session_id.clone())
@@ -263,14 +257,19 @@ fn build_session_results(
     by_session
 }
 
-fn load_catalog_display_stats(index_dir: &Path) -> Option<BTreeMap<PathBuf, CatalogDisplayStats>> {
-    let entries = read_catalog(index_dir).ok()?;
-    Some(
+fn load_catalog_display_stats(
+    index_dir: &Path,
+) -> Result<Option<BTreeMap<PathBuf, CatalogDisplayStats>>> {
+    if !catalog_path(index_dir).exists() {
+        return Ok(None);
+    }
+    let entries = read_catalog(index_dir)?;
+    Ok(Some(
         entries
             .into_iter()
             .filter_map(|entry| entry.display_stats().map(|stats| (entry.path, stats)))
             .collect(),
-    )
+    ))
 }
 
 fn apply_catalog_display_stats(
@@ -337,7 +336,10 @@ fn generate_snippets_parallel(
                         break;
                     }
                     let (path, hits) = &entries[i];
-                    local.push((i, snippets_for_hits(path, hits, query, context_chars, fuzzy)));
+                    local.push((
+                        i,
+                        snippets_for_hits(path, hits, query, context_chars, fuzzy),
+                    ));
                 }
                 local
             }));
@@ -603,7 +605,7 @@ fn snippet_window(text: &str, match_idx: usize, match_len: usize, context_chars:
             }
         }
         result = result
-            .trim_start_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')'))
+            .trim_start_matches(['.', ',', ';', ':', '!', '?', ')'])
             .trim()
             .to_string();
         result = format!("⋯ {result}");
@@ -617,7 +619,7 @@ fn snippet_window(text: &str, match_idx: usize, match_len: usize, context_chars:
             }
         }
         result = result
-            .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '('))
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', '('])
             .trim()
             .to_string();
         result = format!("{result} ⋯");
@@ -771,7 +773,7 @@ pub fn print_session_header(s: &SessionResult, prompts: u32, tools: u32, bytes: 
 
 /// Three-tier fallback used by the Go tool: prompts/answers first, then any
 /// "other" tagged snippets, finally agent/hook (only when verbose).
-pub fn select_visible_snippets<'a>(snippets: &'a [Snippet], verbose: bool) -> Vec<&'a Snippet> {
+pub fn select_visible_snippets(snippets: &[Snippet], verbose: bool) -> Vec<&Snippet> {
     let mut primary = Vec::new();
     let mut secondary = Vec::new();
     let mut tertiary = Vec::new();

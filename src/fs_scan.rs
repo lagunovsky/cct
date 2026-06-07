@@ -60,8 +60,7 @@ pub fn collect_cct_layout(projects_dir: &Path) -> Result<Vec<DiscoveredFile>> {
     let workers = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1)
-        .min(8)
-        .max(1);
+        .clamp(1, 8);
 
     let mut out = if workers == 1 || project_dirs.len() <= 1 {
         let mut buf = Vec::new();

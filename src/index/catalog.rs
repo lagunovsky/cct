@@ -278,7 +278,7 @@ pub fn read_manifest(index_dir: &Path) -> Result<Manifest> {
             "indexes" => {
                 let mut set = BTreeSet::new();
                 for part in value.split(',') {
-                    if let Some(kind) = IndexKind::from_str(part) {
+                    if let Ok(kind) = part.parse::<IndexKind>() {
                         set.insert(kind);
                     }
                 }

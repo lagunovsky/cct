@@ -119,11 +119,9 @@ fn run_loop(items: &[PickerItem], title: &str, out: &mut std::io::Stdout) -> Res
                         }
                         return Ok(result);
                     }
-                    KeyCode::Char(' ') => {
-                        if cursor < visible.len() {
-                            let idx = visible[cursor];
-                            selected[idx] = !selected[idx];
-                        }
+                    KeyCode::Char(' ') if cursor < visible.len() => {
+                        let idx = visible[cursor];
+                        selected[idx] = !selected[idx];
                     }
                     KeyCode::Char('a') => {
                         for &i in &visible {
@@ -143,10 +141,8 @@ fn run_loop(items: &[PickerItem], title: &str, out: &mut std::io::Stdout) -> Res
                         move_cursor(&mut cursor, &visible, KeyCode::Down)
                     }
                     KeyCode::Home | KeyCode::Char('g') => cursor = 0,
-                    KeyCode::End | KeyCode::Char('G') => {
-                        if !visible.is_empty() {
-                            cursor = visible.len() - 1;
-                        }
+                    KeyCode::End | KeyCode::Char('G') if !visible.is_empty() => {
+                        cursor = visible.len() - 1;
                     }
                     _ => {}
                 }
@@ -170,15 +166,11 @@ fn collect_visible(items: &[PickerItem], filter: &str) -> Vec<usize> {
 
 fn move_cursor(cursor: &mut usize, visible: &[usize], code: KeyCode) {
     match code {
-        KeyCode::Up => {
-            if *cursor > 0 {
-                *cursor -= 1;
-            }
+        KeyCode::Up if *cursor > 0 => {
+            *cursor -= 1;
         }
-        KeyCode::Down => {
-            if *cursor + 1 < visible.len() {
-                *cursor += 1;
-            }
+        KeyCode::Down if *cursor + 1 < visible.len() => {
+            *cursor += 1;
         }
         _ => {}
     }
@@ -227,8 +219,7 @@ fn draw(
     }
     let end = (offset + items_per_view).min(visible.len());
 
-    for j in offset..end {
-        let i = visible[j];
+    for (j, &i) in visible.iter().enumerate().take(end).skip(offset) {
         let box_str = if selected[i] {
             format!("[{GREEN}{BOLD}x{RESET}]")
         } else {

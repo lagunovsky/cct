@@ -279,7 +279,8 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     sp.stop();
 
     let render_start = Instant::now();
-    sessions.retain(|s| !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty());
+    sessions
+        .retain(|s| !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty());
     let total = sessions.len();
     let to_show = sessions.len().min(args.limit);
     if to_show == 0 {
@@ -309,7 +310,8 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     let render_elapsed = render_start.elapsed();
 
     let mut delta_optimize_error: Option<String> = None;
-    let delta_optimize_elapsed = match optimize_delta(&index_dir, WriterConfig::for_delta_update()) {
+    let delta_config = WriterConfig::for_delta_update();
+    let delta_optimize_elapsed = match optimize_delta(&index_dir, delta_config) {
         Ok(elapsed) => elapsed,
         Err(err) => {
             delta_optimize_error = Some(format!("{err:#}"));
@@ -456,26 +458,6 @@ fn compute_session_stats(session: &search::SessionResult) -> search::DisplayStat
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn search_timing_parts_include_delta_optimize_when_it_ran() {
-        let parts = search_timing_parts(
-            Duration::from_millis(1),
-            Duration::ZERO,
-            Duration::from_millis(2),
-            Duration::from_millis(1),
-            Some(Duration::from_millis(3)),
-        );
-        let labels: Vec<&str> = parts.iter().map(|(label, _)| *label).collect();
-
-        assert_eq!(labels, vec!["search", "delta optimize"]);
-        assert!(format_timing_parts(&parts).contains("delta optimize 3.00ms"));
-    }
-}
-
 fn compute_session_stats_parallel(
     sessions: &[&search::SessionResult],
 ) -> Vec<search::DisplayStats> {
@@ -521,4 +503,24 @@ fn compute_session_stats_parallel(
         }
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_timing_parts_include_delta_optimize_when_it_ran() {
+        let parts = search_timing_parts(
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Duration::from_millis(2),
+            Duration::from_millis(1),
+            Some(Duration::from_millis(3)),
+        );
+        let labels: Vec<&str> = parts.iter().map(|(label, _)| *label).collect();
+
+        assert_eq!(labels, vec!["search", "delta optimize"]);
+        assert!(format_timing_parts(&parts).contains("delta optimize 3.00ms"));
+    }
 }

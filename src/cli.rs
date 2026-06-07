@@ -211,12 +211,12 @@ pub enum SearchMode {
 pub fn parse_index_list(raw: &str) -> Option<BTreeSet<IndexKind>> {
     let mut set = BTreeSet::new();
     for part in raw.split(',') {
-        match IndexKind::from_str(part.trim()) {
-            Some(k) => {
+        match part.trim().parse::<IndexKind>() {
+            Ok(k) => {
                 set.insert(k);
             }
-            None if part.trim().is_empty() => {}
-            None => return None,
+            Err(()) if part.trim().is_empty() => {}
+            Err(()) => return None,
         }
     }
     Some(set)

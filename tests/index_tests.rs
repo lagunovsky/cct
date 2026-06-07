@@ -731,6 +731,34 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
 }
 
 #[test]
+fn search_reports_incompatible_catalog() -> Result<()> {
+    let fx = Fixture::new()?;
+    fx.write_session(
+        "session-catalog-schema",
+        &format!("{}\n", jsonl_user("catalogschema term")),
+    );
+    fx.full_reindex()?;
+    fs::write(
+        fx.index_dir.join("catalog.tsv"),
+        "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tpath\n",
+    )?;
+
+    let opts = SearchOptions {
+        query: "catalogschema".to_string(),
+        mode: SearchMode::Auto,
+        limit: 20,
+        context_chars: 80,
+        project_prefix: None,
+        fuzzy: false,
+    };
+    let err = run_search(&fx.index_dir, &opts).expect_err("catalog schema must be strict");
+    let message = format!("{err:#}");
+    assert!(message.contains("catalog schema is old or incompatible"));
+    assert!(message.contains("cct reindex"));
+    Ok(())
+}
+
+#[test]
 fn fuzzy_finds_session_when_phrase_is_split_across_lines() -> Result<()> {
     let fx = Fixture::new()?;
     fx.write_session(
@@ -765,7 +793,10 @@ fn fuzzy_finds_session_when_phrase_is_split_across_lines() -> Result<()> {
         .map(|s| s.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(combined.contains("Марат"), "expected Марат in fuzzy snippets");
+    assert!(
+        combined.contains("Марат"),
+        "expected Марат in fuzzy snippets"
+    );
     assert!(
         combined.contains("упрёком"),
         "expected упрёком in fuzzy snippets"
@@ -790,7 +821,10 @@ fn scoped_update_leaves_other_projects_intact() -> Result<()> {
     fx.full_reindex()?;
 
     // Sanity: both terms searchable globally before the scoped update.
-    assert_session(&fx.search("SCOPEDOLD", SearchMode::Auto), "session-scoped-upd");
+    assert_session(
+        &fx.search("SCOPEDOLD", SearchMode::Auto),
+        "session-scoped-upd",
+    );
     assert_session(&fx.search("OTHERTERM", SearchMode::Auto), "session-other");
 
     // Mutate the scoped project: drop the old session, add a new one.
@@ -802,8 +836,7 @@ fn scoped_update_leaves_other_projects_intact() -> Result<()> {
 
     let scope = fx.project_dir.clone();
     let files = collect_one_project(&scope)?;
-    let plan =
-        build_plan_scoped(&fx.index_dir, Some(fx.source.clone()), files, Some(&scope))?;
+    let plan = build_plan_scoped(&fx.index_dir, Some(fx.source.clone()), files, Some(&scope))?;
     let _ = run_update(
         &fx.index_dir,
         plan,

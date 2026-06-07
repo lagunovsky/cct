@@ -93,7 +93,7 @@ pub fn list_project_sessions(proj_abs: &Path) -> Result<Vec<SessionEntry>> {
             size,
         });
     }
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out.sort_by_key(|s| std::cmp::Reverse(s.mtime_ms));
     Ok(out)
 }
 
@@ -141,7 +141,7 @@ fn resolve_session_id(src_dir: &Path, q: &str) -> Result<String> {
     if exact.exists() {
         return Ok(q.to_string());
     }
-    let prefix = format!("{q}");
+    let prefix = q.to_string();
     let mut matches: Vec<String> = Vec::new();
     for entry in fs::read_dir(src_dir)? {
         let entry = entry?;
