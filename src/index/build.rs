@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use tantivy::{doc, Index, IndexWriter, Term};
+use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 use crate::fs_scan::{is_appendable_jsonl, DiscoveredFile};
 use crate::term::fmt_size;
@@ -356,26 +356,17 @@ pub fn add_content_bytes(
         let start_offset = base_offset + chunk.start as u64;
         let end_offset = base_offset + chunk.end as u64;
         for target in content_targets.iter_mut() {
+            let mut document = TantivyDocument::new();
+            document.add_u64(target.fields.file_id, entry.file_id);
+            document.add_u64(target.fields.chunk_id, chunk_id);
             if let Some(project_field) = target.fields.project_id {
-                target.writer.add_document(doc!(
-                    target.fields.file_id => entry.file_id,
-                    target.fields.chunk_id => chunk_id,
-                    project_field => project_id.to_string(),
-                    target.fields.path => path_string.to_string(),
-                    target.fields.start_offset => start_offset,
-                    target.fields.end_offset => end_offset,
-                    target.fields.text => text.clone()
-                ))?;
-            } else {
-                target.writer.add_document(doc!(
-                    target.fields.file_id => entry.file_id,
-                    target.fields.chunk_id => chunk_id,
-                    target.fields.path => path_string.to_string(),
-                    target.fields.start_offset => start_offset,
-                    target.fields.end_offset => end_offset,
-                    target.fields.text => text.clone()
-                ))?;
+                document.add_text(project_field, project_id);
             }
+            document.add_text(target.fields.path, path_string);
+            document.add_u64(target.fields.start_offset, start_offset);
+            document.add_u64(target.fields.end_offset, end_offset);
+            document.add_text(target.fields.text, &text);
+            target.writer.add_document(document)?;
         }
         chunks_added += 1;
     }
@@ -388,26 +379,17 @@ pub fn add_path_document(
     path_string: &str,
     project_id: &str,
 ) -> Result<()> {
+    let mut document = TantivyDocument::new();
+    document.add_u64(target.fields.file_id, entry.file_id);
+    document.add_u64(target.fields.chunk_id, 0u64);
     if let Some(project_field) = target.fields.project_id {
-        target.writer.add_document(doc!(
-            target.fields.file_id => entry.file_id,
-            target.fields.chunk_id => 0u64,
-            project_field => project_id.to_string(),
-            target.fields.path => path_string.to_string(),
-            target.fields.start_offset => 0u64,
-            target.fields.end_offset => entry.size,
-            target.fields.text => path_string.to_string()
-        ))?;
-    } else {
-        target.writer.add_document(doc!(
-            target.fields.file_id => entry.file_id,
-            target.fields.chunk_id => 0u64,
-            target.fields.path => path_string.to_string(),
-            target.fields.start_offset => 0u64,
-            target.fields.end_offset => entry.size,
-            target.fields.text => path_string.to_string()
-        ))?;
+        document.add_text(project_field, project_id);
     }
+    document.add_text(target.fields.path, path_string);
+    document.add_u64(target.fields.start_offset, 0u64);
+    document.add_u64(target.fields.end_offset, entry.size);
+    document.add_text(target.fields.text, path_string);
+    target.writer.add_document(document)?;
     Ok(())
 }
 

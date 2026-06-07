@@ -12,7 +12,7 @@ use anyhow::Result;
 use cct::fs_scan::{collect_cct_layout, collect_one_project};
 use cct::index::build::{run_full_reindex, subindex_segment_count};
 use cct::index::catalog::read_delta_catalog;
-use cct::index::compact::optimize_delta;
+use cct::index::compact::{optimize_delta, DELTA_OPTIMIZE_MIN_SEGMENTS};
 use cct::index::schema::delta_dir;
 use cct::index::search::{run_search, SearchMode, SearchOptions, SessionResult};
 use cct::index::update::{build_plan, build_plan_scoped, flush_delta, needs_update, run_update};
@@ -319,7 +319,7 @@ fn flush_delta_moves_append_ranges_to_main_and_clears_delta() -> Result<()> {
 }
 
 #[test]
-fn optimize_delta_compacts_append_segments() -> Result<()> {
+fn optimize_delta_waits_for_segment_threshold() -> Result<()> {
     let fx = Fixture::new()?;
     let session_path = fx.write_session(
         "session-delta-optimize",
@@ -342,6 +342,20 @@ fn optimize_delta_compacts_append_segments() -> Result<()> {
     assert!(
         subindex_segment_count(&delta, IndexKind::Word)? > 1,
         "two append commits should create multiple delta word segments"
+    );
+    assert!(optimize_delta(&fx.index_dir, WriterConfig::for_delta_update())?.is_none());
+
+    for i in 3..=DELTA_OPTIMIZE_MIN_SEGMENTS {
+        let mut content = fs::read_to_string(&session_path)?;
+        content.push_str(&jsonl_user(&format!("extra OPTDELTA {i}")));
+        content.push('\n');
+        fs::write(&session_path, content)?;
+        fx.update()?;
+    }
+
+    assert!(
+        subindex_segment_count(&delta, IndexKind::Word)? >= DELTA_OPTIMIZE_MIN_SEGMENTS,
+        "delta should reach the auto optimize threshold"
     );
     assert!(optimize_delta(&fx.index_dir, WriterConfig::for_delta_update())?.is_some());
     assert_eq!(subindex_segment_count(&delta, IndexKind::Word)?, 1);

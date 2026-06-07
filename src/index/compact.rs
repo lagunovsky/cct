@@ -16,6 +16,8 @@ use super::catalog::read_manifest;
 use super::schema::{delta_dir, subindex_dir, IndexKind};
 use super::writer::{create_writer, print_writer_config, MergePolicyMode, WriterConfig};
 
+pub const DELTA_OPTIMIZE_MIN_SEGMENTS: usize = 8;
+
 pub fn run_compact(
     index_dir: &Path,
     enabled_override: Option<BTreeSet<IndexKind>>,
@@ -74,7 +76,7 @@ pub fn optimize_delta(index_dir: &Path, mut config: WriterConfig) -> Result<Opti
             continue;
         }
         match quick_segment_count(&root, kind)? {
-            Some(count) if count <= 1 => {}
+            Some(count) if count < DELTA_OPTIMIZE_MIN_SEGMENTS => {}
             _ => needs_compaction.push(kind),
         }
     }

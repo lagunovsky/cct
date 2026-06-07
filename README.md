@@ -106,6 +106,10 @@ A single `cct update` is enough for normal use. The `daemon` subcommand wires
 that up to launchd at 30-minute intervals so most searches run on an already
 warm index.
 
+After a search, `cct` may compact append-only delta segments, but only after a
+delta sub-index reaches 8 segments. This avoids merging a large existing delta
+with every tiny new append.
+
 ## Merge policy / memory
 
 | command   | merge policy default | memory default                                                       |
