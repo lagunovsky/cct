@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use cct::fs_scan::{collect_cct_layout, collect_one_project};
 use cct::index::build::{run_full_reindex, subindex_segment_count};
-use cct::index::catalog::read_delta_catalog;
+use cct::index::catalog::{read_catalog, read_delta_catalog};
 use cct::index::compact::{optimize_delta, DELTA_OPTIMIZE_MIN_SEGMENTS};
 use cct::index::schema::delta_dir;
 use cct::index::search::{run_search, SearchMode, SearchOptions, SessionResult};
@@ -146,7 +146,7 @@ fn assert_session(results: &[SessionResult], session_id: &str) {
 #[test]
 fn reindex_finds_normal_word() -> Result<()> {
     let fx = Fixture::new()?;
-    fx.write_session(
+    let session_path = fx.write_session(
         "session-words",
         &format!(
             "{}\n{}\n",
@@ -157,6 +157,25 @@ fn reindex_finds_normal_word() -> Result<()> {
     fx.full_reindex()?;
     let results = fx.search("brown", SearchMode::Auto);
     assert_session(&results, "session-words");
+    let entry = read_catalog(&fx.index_dir)?
+        .into_iter()
+        .find(|entry| entry.path == session_path)
+        .expect("session must be in catalog");
+    assert_eq!(entry.prompts, Some(1));
+    assert_eq!(entry.tools, Some(0));
+    assert_eq!(
+        entry.display_bytes,
+        Some(fs::metadata(&session_path)?.len())
+    );
+
+    let session = results
+        .iter()
+        .find(|result| result.session_id == "session-words")
+        .expect("session result");
+    let display = session.display_stats.expect("cached display stats");
+    assert_eq!(display.prompts, 1);
+    assert_eq!(display.tools, 0);
+    assert_eq!(display.bytes, fs::metadata(&session_path)?.len());
     Ok(())
 }
 
@@ -208,6 +227,17 @@ fn append_update_indexes_only_complete_lines() -> Result<()> {
     fs::write(&session_path, content)?;
 
     fx.update()?;
+    let entry = read_catalog(&fx.index_dir)?
+        .into_iter()
+        .find(|entry| entry.path == session_path)
+        .expect("session must be in catalog");
+    assert_eq!(entry.prompts, Some(2));
+    assert_eq!(entry.tools, Some(0));
+    assert_eq!(
+        entry.display_bytes,
+        Some(fs::metadata(&session_path)?.len())
+    );
+
     let results = fx.search("telescopes", SearchMode::Auto);
     assert_session(&results, "session-append");
 

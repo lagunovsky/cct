@@ -52,7 +52,7 @@ cct daemon uninstall
   word/         SimpleTokenizer + LowerCaser → natural-language queries, short tokens like "АД"
   trigram/      NgramTokenizer(3,3) + LowerCaser → APIError, traceback substrings
   path/         trigram over file paths
-  catalog.tsv   per-file row: file_id, kind, size, mtime_ms, indexed_offset, next_chunk_id, path
+  catalog.tsv   per-file row: file_id, kind, size, mtime_ms, indexed_offset, next_chunk_id, prompts, tools, display_bytes, path
   manifest.txt  source dir, enabled indexes, writer config used to build it
 ```
 

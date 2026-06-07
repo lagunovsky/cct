@@ -20,6 +20,7 @@ use crate::text::{
 };
 
 use super::build::{read_file_range, stored_string, stored_u64};
+use super::catalog::{read_catalog, CatalogDisplayStats};
 use super::schema::{
     delta_dir, fields_from_schema, register_tokenizers, subindex_dir, IndexKind, NGRAM_TOKENIZER,
     WORD_TOKENIZER,
@@ -54,6 +55,13 @@ pub struct SearchOptions {
     pub fuzzy: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisplayStats {
+    pub prompts: u32,
+    pub tools: u32,
+    pub bytes: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snippet {
     pub tag: String,
@@ -69,6 +77,7 @@ pub struct SessionResult {
     pub files: BTreeSet<PathBuf>,
     pub snippets: Vec<Snippet>,
     pub last_msg_ms: i64,
+    pub display_stats: Option<DisplayStats>,
 }
 
 pub fn select_indexes(mode: SearchMode, query: &str) -> Vec<IndexKind> {
@@ -156,7 +165,14 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     }
 
     let groups = group_hits_by_file(hits);
-    let by_session = build_session_results(groups, &opts.query, opts.context_chars, opts.fuzzy);
+    let catalog_stats = load_catalog_display_stats(index_dir);
+    let by_session = build_session_results(
+        groups,
+        &opts.query,
+        opts.context_chars,
+        opts.fuzzy,
+        catalog_stats.as_ref(),
+    );
 
     let mut sessions: Vec<SessionResult> = by_session.into_values().collect();
     sessions.sort_by(|a, b| b.last_msg_ms.cmp(&a.last_msg_ms));
@@ -192,6 +208,7 @@ fn build_session_results(
     query: &str,
     context_chars: usize,
     fuzzy: bool,
+    catalog_stats: Option<&BTreeMap<PathBuf, CatalogDisplayStats>>,
 ) -> BTreeMap<String, SessionResult> {
     const MAX_SNIPPETS_PER_SESSION: usize = 10;
 
@@ -214,9 +231,11 @@ fn build_session_results(
                 files: BTreeSet::new(),
                 snippets: Vec::new(),
                 last_msg_ms: 0,
+                display_stats: catalog_stats.map(|_| DisplayStats::default()),
             });
         entry.sources.insert(source);
         entry.files.insert(path.clone());
+        apply_catalog_display_stats(entry, &path, catalog_stats);
         if entry.project == "?" && project != "?" {
             entry.project = project;
         }
@@ -249,6 +268,40 @@ fn build_session_results(
         }
     }
     by_session
+}
+
+fn load_catalog_display_stats(index_dir: &Path) -> Option<BTreeMap<PathBuf, CatalogDisplayStats>> {
+    let entries = read_catalog(index_dir).ok()?;
+    Some(
+        entries
+            .into_iter()
+            .filter_map(|entry| entry.display_stats().map(|stats| (entry.path, stats)))
+            .collect(),
+    )
+}
+
+fn apply_catalog_display_stats(
+    session: &mut SessionResult,
+    path: &Path,
+    catalog_stats: Option<&BTreeMap<PathBuf, CatalogDisplayStats>>,
+) {
+    if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+        return;
+    }
+    let Some(stats_by_path) = catalog_stats else {
+        session.display_stats = None;
+        return;
+    };
+    let Some(stats) = stats_by_path.get(path) else {
+        session.display_stats = None;
+        return;
+    };
+    let Some(display_stats) = session.display_stats.as_mut() else {
+        return;
+    };
+    display_stats.prompts = display_stats.prompts.max(stats.prompts);
+    display_stats.tools = display_stats.tools.max(stats.tools);
+    display_stats.bytes = display_stats.bytes.max(stats.bytes);
 }
 
 fn generate_snippets_parallel(

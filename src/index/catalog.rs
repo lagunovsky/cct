@@ -10,7 +10,10 @@ use anyhow::{bail, Context, Result};
 use super::schema::IndexKind;
 use super::writer::WriterConfig;
 
-const CATALOG_HEADER: &str = "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tpath";
+const CATALOG_HEADER_V1: &str =
+    "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tpath";
+const CATALOG_HEADER: &str =
+    "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tprompts\ttools\tdisplay_bytes\tpath";
 const DELTA_CATALOG_HEADER: &str =
     "file_id\tstart_offset\tend_offset\tstart_chunk_id\tend_chunk_id\tpath";
 
@@ -22,7 +25,27 @@ pub struct CatalogEntry {
     pub mtime_ms: u128,
     pub indexed_offset: u64,
     pub next_chunk_id: u64,
+    pub prompts: Option<u32>,
+    pub tools: Option<u32>,
+    pub display_bytes: Option<u64>,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CatalogDisplayStats {
+    pub prompts: u32,
+    pub tools: u32,
+    pub bytes: u64,
+}
+
+impl CatalogEntry {
+    pub fn display_stats(&self) -> Option<CatalogDisplayStats> {
+        Some(CatalogDisplayStats {
+            prompts: self.prompts?,
+            tools: self.tools?,
+            bytes: self.display_bytes?,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,20 +72,25 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut lines = raw.lines();
     let header = lines.next().unwrap_or_default();
-    if header != CATALOG_HEADER {
-        bail!(
-            "catalog schema is old or incompatible: {}\nRebuild with `cct reindex`.",
-            path.display()
-        );
-    }
+    let has_display_stats = match header {
+        CATALOG_HEADER => true,
+        CATALOG_HEADER_V1 => false,
+        _ => {
+            bail!(
+                "catalog schema is old or incompatible: {}\nRebuild with `cct reindex`.",
+                path.display()
+            );
+        }
+    };
 
     let mut entries = Vec::new();
     for (line_no, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(7, '\t').collect();
-        if parts.len() != 7 {
+        let expected_parts = if has_display_stats { 10 } else { 7 };
+        let parts: Vec<&str> = line.splitn(expected_parts, '\t').collect();
+        if parts.len() != expected_parts {
             bail!("bad catalog line {} in {}", line_no + 2, path.display());
         }
         entries.push(CatalogEntry {
@@ -82,10 +110,47 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
             next_chunk_id: parts[5]
                 .parse()
                 .with_context(|| format!("bad next_chunk_id at catalog line {}", line_no + 2))?,
-            path: PathBuf::from(parts[6]),
+            prompts: if has_display_stats {
+                parse_optional_u32(parts[6], "prompts", line_no + 2)?
+            } else {
+                None
+            },
+            tools: if has_display_stats {
+                parse_optional_u32(parts[7], "tools", line_no + 2)?
+            } else {
+                None
+            },
+            display_bytes: if has_display_stats {
+                parse_optional_u64(parts[8], "display_bytes", line_no + 2)?
+            } else {
+                None
+            },
+            path: PathBuf::from(if has_display_stats {
+                parts[9]
+            } else {
+                parts[6]
+            }),
         });
     }
     Ok(entries)
+}
+
+fn parse_optional_u32(raw: &str, field: &str, line_no: usize) -> Result<Option<u32>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse()
+        .map(Some)
+        .with_context(|| format!("bad {field} at catalog line {line_no}"))
+}
+
+fn parse_optional_u64(raw: &str, field: &str, line_no: usize) -> Result<Option<u64>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse()
+        .map(Some)
+        .with_context(|| format!("bad {field} at catalog line {line_no}"))
 }
 
 /// Write the catalog atomically via tmp+rename.
@@ -99,15 +164,21 @@ pub fn write_catalog(index_dir: &Path, entries: &[CatalogEntry]) -> Result<PathB
     let mut f = BufWriter::new(File::create(&tmp_path)?);
     writeln!(f, "{CATALOG_HEADER}")?;
     for e in sorted {
+        let prompts = e.prompts.map(|n| n.to_string()).unwrap_or_default();
+        let tools = e.tools.map(|n| n.to_string()).unwrap_or_default();
+        let display_bytes = e.display_bytes.map(|n| n.to_string()).unwrap_or_default();
         writeln!(
             f,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             e.file_id,
             e.kind,
             e.size,
             e.mtime_ms,
             e.indexed_offset,
             e.next_chunk_id,
+            prompts,
+            tools,
+            display_bytes,
             e.path.to_string_lossy()
         )?;
     }

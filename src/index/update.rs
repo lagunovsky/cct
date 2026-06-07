@@ -511,9 +511,12 @@ pub fn flush_delta(index_dir: &Path, config: WriterConfig, verbose: bool) -> Res
             mtime_ms: 0,
             indexed_offset: delta.end_offset,
             next_chunk_id: delta.start_chunk_id,
+            prompts: None,
+            tools: None,
+            display_bytes: None,
             path: delta.path.clone(),
         };
-        add_content_bytes(
+        let _content = add_content_bytes(
             &mut targets,
             &mut entry,
             &data,
@@ -547,6 +550,9 @@ mod tests {
             mtime_ms,
             indexed_offset: size,
             next_chunk_id: 1,
+            prompts: None,
+            tools: None,
+            display_bytes: None,
             path: PathBuf::from(path),
         }
     }

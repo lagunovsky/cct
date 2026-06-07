@@ -20,7 +20,7 @@ use crate::path_codec::{
 };
 use crate::recent::{show_recent_sessions, RecentOptions};
 use crate::term::{Spinner, BOLD, DIM, RESET};
-use crate::text::{extract_text, SessionStats};
+use crate::text::extract_text;
 
 pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
     match cmd {
@@ -401,16 +401,12 @@ fn resolve_project_prefix(args: &cli::SearchCmd) -> Result<Option<ResolvedProjec
     Ok(Some(ResolvedProject { prefix, label }))
 }
 
-#[derive(Default, Clone, Copy)]
-struct DisplayStats {
-    prompts: u32,
-    tools: u32,
-    bytes: u64,
-}
-
 /// Read each session jsonl file (small in practice) to derive prompts/tools/size for display.
-fn compute_session_stats(session: &search::SessionResult) -> DisplayStats {
-    let mut out = DisplayStats::default();
+fn compute_session_stats(session: &search::SessionResult) -> search::DisplayStats {
+    if let Some(stats) = session.display_stats {
+        return stats;
+    }
+    let mut out = search::DisplayStats::default();
     for path in &session.files {
         let Ok(meta) = fs::metadata(path) else {
             continue;
@@ -422,7 +418,7 @@ fn compute_session_stats(session: &search::SessionResult) -> DisplayStats {
             out.bytes = meta.len();
         }
         if let Ok(data) = fs::read(path) {
-            let (_, stats): (String, SessionStats) = extract_text(&data);
+            let (_, stats) = extract_text(&data);
             out.prompts = out.prompts.max(stats.prompts);
             out.tools = out.tools.max(stats.tools);
         }
@@ -430,7 +426,9 @@ fn compute_session_stats(session: &search::SessionResult) -> DisplayStats {
     out
 }
 
-fn compute_session_stats_parallel(sessions: &[&search::SessionResult]) -> Vec<DisplayStats> {
+fn compute_session_stats_parallel(
+    sessions: &[&search::SessionResult],
+) -> Vec<search::DisplayStats> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let n = sessions.len();
     if n <= 1 {
@@ -445,13 +443,13 @@ fn compute_session_stats_parallel(sessions: &[&search::SessionResult]) -> Vec<Di
     if workers == 1 {
         return sessions.iter().map(|s| compute_session_stats(s)).collect();
     }
-    let mut out: Vec<DisplayStats> = vec![DisplayStats::default(); n];
+    let mut out: Vec<search::DisplayStats> = vec![search::DisplayStats::default(); n];
     let counter = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let counter = &counter;
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            handles.push(scope.spawn(move || -> Vec<(usize, DisplayStats)> {
+            handles.push(scope.spawn(move || -> Vec<(usize, search::DisplayStats)> {
                 let mut local = Vec::new();
                 loop {
                     let i = counter.fetch_add(1, Ordering::Relaxed);

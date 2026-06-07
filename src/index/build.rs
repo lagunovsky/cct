@@ -10,7 +10,7 @@ use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 use crate::fs_scan::{is_appendable_jsonl, DiscoveredFile};
 use crate::term::fmt_size;
-use crate::text::extract_text;
+use crate::text::{extract_text, SessionStats};
 
 use super::catalog::{write_catalog, write_manifest, CatalogEntry};
 use super::schema::{
@@ -30,6 +30,13 @@ pub struct BuildTarget {
 pub struct ByteChunk {
     pub start: usize,
     pub end: usize,
+}
+
+#[derive(Default)]
+pub struct ContentAddResult {
+    pub chunks: u64,
+    pub stats: SessionStats,
+    pub stats_available: bool,
 }
 
 /// Full reindex from scratch. Wipes `index_dir` first when it exists.
@@ -245,6 +252,9 @@ pub fn add_whole_file(
         mtime_ms,
         indexed_offset: indexed_len as u64,
         next_chunk_id: 0,
+        prompts: None,
+        tools: None,
+        display_bytes: None,
         path: file.path.clone(),
     };
 
@@ -252,7 +262,7 @@ pub fn add_whole_file(
         add_path_document(target, &entry, &path_string, &project_id)?;
     }
 
-    let chunks = add_content_bytes(
+    let content = add_content_bytes(
         targets,
         &mut entry,
         &data[..indexed_len],
@@ -260,7 +270,10 @@ pub fn add_whole_file(
         &path_string,
         &project_id,
     )?;
-    Ok((entry, chunks))
+    if content.stats_available {
+        set_entry_display_stats(&mut entry, &file.path, content.stats);
+    }
+    Ok((entry, content.chunks))
 }
 
 fn catalog_identity_for_read(
@@ -307,7 +320,7 @@ pub fn append_file_tail(
     let indexed_end = start + indexed_len as u64;
     let path_string = file.path.to_string_lossy().into_owned();
     let project_id = project_id_for_path(&file.path);
-    let chunks = add_content_bytes(
+    let content = add_content_bytes(
         targets,
         entry,
         &data[..indexed_len],
@@ -315,6 +328,9 @@ pub fn append_file_tail(
         &path_string,
         &project_id,
     )?;
+    if content.stats_available {
+        append_entry_display_stats(entry, &file.path, content.stats, file.size);
+    }
 
     entry.kind = file.kind.as_str().to_string();
     entry.size = file.size;
@@ -323,7 +339,7 @@ pub fn append_file_tail(
     entry.path = file.path.clone();
 
     Ok(AppendResult {
-        chunks,
+        chunks: content.chunks,
         read_bytes: data.len() as u64,
         indexed_bytes: indexed_len as u64,
     })
@@ -336,18 +352,27 @@ pub fn add_content_bytes(
     base_offset: u64,
     path_string: &str,
     project_id: &str,
-) -> Result<u64> {
+) -> Result<ContentAddResult> {
     let mut content_targets: Vec<&mut BuildTarget> = targets
         .iter_mut()
         .filter(|t| matches!(t.kind, IndexKind::Word | IndexKind::Trigram))
         .collect();
-    if content_targets.is_empty() || data.is_empty() {
-        return Ok(0);
+    if content_targets.is_empty() {
+        return Ok(ContentAddResult::default());
+    }
+    if data.is_empty() {
+        return Ok(ContentAddResult {
+            chunks: 0,
+            stats: SessionStats::default(),
+            stats_available: true,
+        });
     }
 
     let mut chunks_added = 0u64;
+    let mut stats = SessionStats::default();
     for chunk in line_chunks(data) {
-        let (text, _stats) = extract_text(&data[chunk.start..chunk.end]);
+        let (text, chunk_stats) = extract_text(&data[chunk.start..chunk.end]);
+        add_session_stats(&mut stats, chunk_stats);
         if text.trim().is_empty() {
             continue;
         }
@@ -370,7 +395,11 @@ pub fn add_content_bytes(
         }
         chunks_added += 1;
     }
-    Ok(chunks_added)
+    Ok(ContentAddResult {
+        chunks: chunks_added,
+        stats,
+        stats_available: true,
+    })
 }
 
 pub fn add_path_document(
@@ -406,6 +435,44 @@ pub fn project_id_for_path(path: &Path) -> String {
         })
         .unwrap_or(path);
     project_dir.to_string_lossy().into_owned()
+}
+
+fn set_entry_display_stats(entry: &mut CatalogEntry, path: &Path, stats: SessionStats) {
+    if !is_display_stats_file(path) {
+        return;
+    }
+    entry.prompts = Some(stats.prompts);
+    entry.tools = Some(stats.tools);
+    entry.display_bytes = Some(entry.size);
+}
+
+fn append_entry_display_stats(
+    entry: &mut CatalogEntry,
+    path: &Path,
+    stats: SessionStats,
+    file_size: u64,
+) {
+    if !is_display_stats_file(path) {
+        return;
+    }
+    let (Some(prompts), Some(tools), Some(_bytes)) =
+        (entry.prompts, entry.tools, entry.display_bytes)
+    else {
+        return;
+    };
+    entry.prompts = Some(prompts.saturating_add(stats.prompts));
+    entry.tools = Some(tools.saturating_add(stats.tools));
+    entry.display_bytes = Some(file_size);
+}
+
+fn is_display_stats_file(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+}
+
+fn add_session_stats(total: &mut SessionStats, stats: SessionStats) {
+    total.prompts = total.prompts.saturating_add(stats.prompts);
+    total.answers = total.answers.saturating_add(stats.answers);
+    total.tools = total.tools.saturating_add(stats.tools);
 }
 
 pub fn delete_file_docs(targets: &mut [BuildTarget], file_id: u64) {
