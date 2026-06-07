@@ -1,7 +1,7 @@
 # cct
 
 Claude Code Tools — fast full-text search across Claude Code session logs, plus
-utilities to rename / move sessions when project directories change.
+utilities to rename projects and transfer sessions when project directories change.
 
 The search backend is [Tantivy](https://github.com/quickwit-oss/tantivy): three
 physical indexes (word, trigram, path) sit under `~/.claude/search-index/`,
@@ -87,6 +87,14 @@ adds:
 
 You can pin to a specific backend with `--mode word|trigram|path|all`.
 
+Multi-word queries are AND-ed and matched as a phrase on one line by default.
+Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets
+even when the full phrase never appears on a single line.
+
+Slash-command invocations (`<command-name>/research</command-name>` blocks in
+the logs) are indexed and rendered as plain `/research <args>`, so searching
+for `/research` finds the sessions that ran it.
+
 Snippets come from the chunk byte range stored on each Tantivy doc, then
 re-extracted as JSON values when possible. The default context window is `120`
 characters around the match (`-c N` to override).
@@ -120,32 +128,40 @@ with every tiny new append.
 All three honor `--memory-mb`, `--worker-threads`, `--merge-threads`, and
 `--only word,trigram,path`.
 
-## Rename / move
+## Rename / transfer
 
 If a project's directory was renamed or moved, `/resume` in Claude Code stops
 finding past sessions because they live under
 `~/.claude/projects/<encoded-path>/` and the embedded `cwd` field still points
 at the old path.
 
+`cct rename` physically moves the project directory and migrates all of its
+sessions in one step:
+
 ```sh
 cct rename ../new-name                    # old = cwd
 cct rename /old/abs /new/abs              # explicit
-cct rename --move-dir . ../new            # also rename the project dir itself
+cct rename --no-move-dir . ../new         # dir already moved on disk; only fix sessions
 cct rename --dry-run . ../new             # preview only
 ```
 
-This renames `~/.claude/projects/<encoded-old>` → `<encoded-new>` and rewrites
-every occurrence of the old absolute path inside `.jsonl` files (including
-`cwd`). The next `cct update` (or any `cct search`) reconciles the index by
-deleting the old `file_id`s and re-adding the relocated files.
+This moves the on-disk project dir, renames
+`~/.claude/projects/<encoded-old>` → `<encoded-new>`, and rewrites every
+occurrence of the old absolute path inside `.jsonl` files (including `cwd`).
+Pass `--no-move-dir` when the project directory was already moved by hand and
+only the session logs need their `cwd` rewired. The next `cct update` (or any
+`cct search`) reconciles the index by deleting the old `file_id`s and re-adding
+the relocated files.
+
+`cct transfer` moves individual sessions from one project into another:
 
 ```sh
-cct move ../other                         # interactive: pick sessions from cwd
-cct move ../other abc123 def456           # by full id or unique prefix
-cct move ../other abc123,def456           # comma-separated also accepted
-cct move --from /old/proj ../other abc    # source other than cwd
-cct move --dry-run ../other abc123        # preview
-cct move -y ../other abc123               # skip confirmation prompt
+cct transfer ../other                     # interactive: pick sessions from cwd
+cct transfer ../other abc123 def456       # by full id or unique prefix
+cct transfer ../other abc123,def456       # comma-separated also accepted
+cct transfer --from /old/proj ../other abc  # source other than cwd
+cct transfer --dry-run ../other abc123    # preview
+cct transfer -y ../other abc123           # skip confirmation prompt
 ```
 
 Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
@@ -155,13 +171,13 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 
 | Command | Description |
 |---------|-------------|
-| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `--mode`, `--no-update` |
+| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--mode`, `--no-update` |
 | `cct recent` | Recent sessions in cwd; flag: `-n` |
 | `cct reindex` | Rebuild the Tantivy index from scratch |
 | `cct update` | Incremental update (auto on each search; manual when scripted) |
 | `cct compact` | Merge Tantivy segments to `--target-segments` (default 1) |
-| `cct rename [old] <new>` | Migrate session dir + rewrite `cwd`; flags: `--move-dir`, `--dry-run` |
-| `cct move <target> [ids...]` | Move specific sessions; flags: `--from`, `-y`, `--dry-run` |
+| `cct rename [old] <new>` | Move project dir + migrate sessions + rewrite `cwd`; flags: `--no-move-dir`, `--dry-run` |
+| `cct transfer <target> [ids...]` | Transfer specific sessions between projects; flags: `--from`, `-y`, `--dry-run` |
 | `cct daemon install` | Install launchd job for background indexing every 30 min on AC power |
 | `cct daemon uninstall` | Remove launchd job |
 | `cct daemon update` | Background update entry point used by launchd |
