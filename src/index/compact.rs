@@ -1,6 +1,7 @@
 //! Explicit segment compaction.
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -67,13 +68,26 @@ pub fn optimize_delta(index_dir: &Path, mut config: WriterConfig) -> Result<Opti
     }
     config.merge_policy = MergePolicyMode::None;
 
-    let start = Instant::now();
+    let mut needs_compaction = Vec::new();
     for kind in [IndexKind::Word, IndexKind::Trigram, IndexKind::Path] {
-        if subindex_dir(&root, kind).is_dir() {
-            compact_one_index_quiet(&root, kind, config, 1)?;
+        if !subindex_dir(&root, kind).is_dir() {
+            continue;
+        }
+        match quick_segment_count(&root, kind)? {
+            Some(count) if count <= 1 => {}
+            _ => needs_compaction.push(kind),
         }
     }
-    Ok(Some(start.elapsed()))
+    if needs_compaction.is_empty() {
+        return Ok(None);
+    }
+
+    let start = Instant::now();
+    let mut merged = false;
+    for kind in needs_compaction {
+        merged |= compact_one_index_quiet(&root, kind, config, 1)?;
+    }
+    Ok(merged.then(|| start.elapsed()))
 }
 
 fn compact_one_index(
@@ -143,13 +157,13 @@ fn compact_one_index_quiet(
     kind: IndexKind,
     config: WriterConfig,
     target_segments: usize,
-) -> Result<()> {
+) -> Result<bool> {
     let dir = subindex_dir(root, kind);
     let index =
         Index::open_in_dir(&dir).with_context(|| format!("open index {}", dir.display()))?;
     let metas = index.searchable_segment_metas()?;
     if metas.len() <= target_segments {
-        return Ok(());
+        return Ok(false);
     }
 
     let groups = segment_merge_groups(metas, target_segments);
@@ -165,7 +179,23 @@ fn compact_one_index_quiet(
         future.wait()?;
     }
     writer.wait_merging_threads()?;
-    Ok(())
+    Ok(true)
+}
+
+fn quick_segment_count(root: &Path, kind: IndexKind) -> Result<Option<usize>> {
+    let meta_path = subindex_dir(root, kind).join("meta.json");
+    let raw = match fs::read_to_string(&meta_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", meta_path.display())),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(None);
+    };
+    Ok(value
+        .get("segments")
+        .and_then(|segments| segments.as_array())
+        .map(|segments| segments.len()))
 }
 
 fn segment_merge_groups(

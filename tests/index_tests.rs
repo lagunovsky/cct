@@ -345,6 +345,7 @@ fn optimize_delta_compacts_append_segments() -> Result<()> {
     );
     assert!(optimize_delta(&fx.index_dir, WriterConfig::for_delta_update())?.is_some());
     assert_eq!(subindex_segment_count(&delta, IndexKind::Word)?, 1);
+    assert!(optimize_delta(&fx.index_dir, WriterConfig::for_delta_update())?.is_none());
     assert_session(
         &fx.search("OPTDELTA", SearchMode::Auto),
         "session-delta-optimize",
