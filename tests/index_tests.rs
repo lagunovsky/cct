@@ -666,6 +666,9 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
     )?;
 
     fx.full_reindex()?;
+    let word_index = tantivy::Index::open_in_dir(fx.index_dir.join("word"))?;
+    assert!(word_index.schema().get_field("project_id").is_ok());
+
     let opts = SearchOptions {
         query: "boundaryterm".to_string(),
         mode: SearchMode::Auto,

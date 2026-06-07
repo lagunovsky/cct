@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, INDEXED, STORED,
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, INDEXED, STORED, STRING,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, SimpleTokenizer, TextAnalyzer};
 use tantivy::Index;
@@ -54,6 +54,7 @@ impl IndexKind {
 pub struct Fields {
     pub file_id: Field,
     pub chunk_id: Field,
+    pub project_id: Option<Field>,
     pub path: Field,
     pub start_offset: Field,
     pub end_offset: Field,
@@ -64,6 +65,7 @@ pub fn schema_and_fields(kind: IndexKind) -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let file_id = builder.add_u64_field("file_id", INDEXED | STORED);
     let chunk_id = builder.add_u64_field("chunk_id", STORED);
+    let project_id = builder.add_text_field("project_id", STRING | STORED);
     let path = builder.add_text_field("path", TextOptions::default().set_stored());
     let start_offset = builder.add_u64_field("start_offset", STORED);
     let end_offset = builder.add_u64_field("end_offset", STORED);
@@ -79,6 +81,7 @@ pub fn schema_and_fields(kind: IndexKind) -> (Schema, Fields) {
         Fields {
             file_id,
             chunk_id,
+            project_id: Some(project_id),
             path,
             start_offset,
             end_offset,
@@ -91,6 +94,7 @@ pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
     Ok(Fields {
         file_id: schema.get_field("file_id")?,
         chunk_id: schema.get_field("chunk_id")?,
+        project_id: schema.get_field("project_id").ok(),
         path: schema.get_field("path")?,
         start_offset: schema.get_field("start_offset")?,
         end_offset: schema.get_field("end_offset")?,

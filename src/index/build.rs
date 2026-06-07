@@ -237,6 +237,7 @@ pub fn add_whole_file(
     let (size, mtime_ms) = catalog_identity_for_read(file, data.len(), before_read, after_read);
     let indexed_len = indexable_prefix_len(&file.path, &data);
     let path_string = file.path.to_string_lossy().into_owned();
+    let project_id = project_id_for_path(&file.path);
     let mut entry = CatalogEntry {
         file_id,
         kind: file.kind.as_str().to_string(),
@@ -248,10 +249,17 @@ pub fn add_whole_file(
     };
 
     for target in targets.iter_mut().filter(|t| t.kind == IndexKind::Path) {
-        add_path_document(target, &entry, &path_string)?;
+        add_path_document(target, &entry, &path_string, &project_id)?;
     }
 
-    let chunks = add_content_bytes(targets, &mut entry, &data[..indexed_len], 0, &path_string)?;
+    let chunks = add_content_bytes(
+        targets,
+        &mut entry,
+        &data[..indexed_len],
+        0,
+        &path_string,
+        &project_id,
+    )?;
     Ok((entry, chunks))
 }
 
@@ -298,7 +306,15 @@ pub fn append_file_tail(
     let indexed_len = indexable_prefix_len(&file.path, &data);
     let indexed_end = start + indexed_len as u64;
     let path_string = file.path.to_string_lossy().into_owned();
-    let chunks = add_content_bytes(targets, entry, &data[..indexed_len], start, &path_string)?;
+    let project_id = project_id_for_path(&file.path);
+    let chunks = add_content_bytes(
+        targets,
+        entry,
+        &data[..indexed_len],
+        start,
+        &path_string,
+        &project_id,
+    )?;
 
     entry.kind = file.kind.as_str().to_string();
     entry.size = file.size;
@@ -319,6 +335,7 @@ pub fn add_content_bytes(
     data: &[u8],
     base_offset: u64,
     path_string: &str,
+    project_id: &str,
 ) -> Result<u64> {
     let mut content_targets: Vec<&mut BuildTarget> = targets
         .iter_mut()
@@ -339,14 +356,26 @@ pub fn add_content_bytes(
         let start_offset = base_offset + chunk.start as u64;
         let end_offset = base_offset + chunk.end as u64;
         for target in content_targets.iter_mut() {
-            target.writer.add_document(doc!(
-                target.fields.file_id => entry.file_id,
-                target.fields.chunk_id => chunk_id,
-                target.fields.path => path_string.to_string(),
-                target.fields.start_offset => start_offset,
-                target.fields.end_offset => end_offset,
-                target.fields.text => text.clone()
-            ))?;
+            if let Some(project_field) = target.fields.project_id {
+                target.writer.add_document(doc!(
+                    target.fields.file_id => entry.file_id,
+                    target.fields.chunk_id => chunk_id,
+                    project_field => project_id.to_string(),
+                    target.fields.path => path_string.to_string(),
+                    target.fields.start_offset => start_offset,
+                    target.fields.end_offset => end_offset,
+                    target.fields.text => text.clone()
+                ))?;
+            } else {
+                target.writer.add_document(doc!(
+                    target.fields.file_id => entry.file_id,
+                    target.fields.chunk_id => chunk_id,
+                    target.fields.path => path_string.to_string(),
+                    target.fields.start_offset => start_offset,
+                    target.fields.end_offset => end_offset,
+                    target.fields.text => text.clone()
+                ))?;
+            }
         }
         chunks_added += 1;
     }
@@ -357,16 +386,44 @@ pub fn add_path_document(
     target: &mut BuildTarget,
     entry: &CatalogEntry,
     path_string: &str,
+    project_id: &str,
 ) -> Result<()> {
-    target.writer.add_document(doc!(
-        target.fields.file_id => entry.file_id,
-        target.fields.chunk_id => 0u64,
-        target.fields.path => path_string.to_string(),
-        target.fields.start_offset => 0u64,
-        target.fields.end_offset => entry.size,
-        target.fields.text => path_string.to_string()
-    ))?;
+    if let Some(project_field) = target.fields.project_id {
+        target.writer.add_document(doc!(
+            target.fields.file_id => entry.file_id,
+            target.fields.chunk_id => 0u64,
+            project_field => project_id.to_string(),
+            target.fields.path => path_string.to_string(),
+            target.fields.start_offset => 0u64,
+            target.fields.end_offset => entry.size,
+            target.fields.text => path_string.to_string()
+        ))?;
+    } else {
+        target.writer.add_document(doc!(
+            target.fields.file_id => entry.file_id,
+            target.fields.chunk_id => 0u64,
+            target.fields.path => path_string.to_string(),
+            target.fields.start_offset => 0u64,
+            target.fields.end_offset => entry.size,
+            target.fields.text => path_string.to_string()
+        ))?;
+    }
     Ok(())
+}
+
+pub fn project_id_for_path(path: &Path) -> String {
+    let project_dir = path
+        .parent()
+        .and_then(|parent| {
+            let parent_name = parent.file_name().and_then(|s| s.to_str());
+            if matches!(parent_name, Some("subagents" | "tool-results")) {
+                parent.parent().and_then(Path::parent)
+            } else {
+                Some(parent)
+            }
+        })
+        .unwrap_or(path);
+    project_dir.to_string_lossy().into_owned()
 }
 
 pub fn delete_file_docs(targets: &mut [BuildTarget], file_id: u64) {
@@ -527,4 +584,27 @@ pub fn stored_string(doc: &TantivyDoc, field: tantivy::schema::Field) -> Option<
 pub fn stored_u64(doc: &TantivyDoc, field: tantivy::schema::Field) -> Option<u64> {
     use tantivy::schema::Value;
     doc.get_first(field)?.as_u64()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::project_id_for_path;
+
+    #[test]
+    fn project_id_for_indexed_paths_points_at_project_dir() {
+        assert_eq!(
+            project_id_for_path(Path::new("/projects/-proj/session.jsonl")),
+            "/projects/-proj"
+        );
+        assert_eq!(
+            project_id_for_path(Path::new("/projects/-proj/session/subagents/agent.jsonl")),
+            "/projects/-proj"
+        );
+        assert_eq!(
+            project_id_for_path(Path::new("/projects/-proj/session/tool-results/out.log")),
+            "/projects/-proj"
+        );
+    }
 }

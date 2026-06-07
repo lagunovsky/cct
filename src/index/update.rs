@@ -12,8 +12,8 @@ use crate::term::fmt_size;
 
 use super::build::{
     add_content_bytes, add_whole_file, append_file_tail, create_or_open_targets, delete_file_docs,
-    dir_size, open_existing_targets, open_optional_targets, read_file_range, size_ratio,
-    subindex_segment_count,
+    dir_size, open_existing_targets, open_optional_targets, project_id_for_path, read_file_range,
+    size_ratio, subindex_segment_count,
 };
 use super::catalog::{
     read_catalog, read_delta_catalog, read_manifest, write_catalog, write_delta_catalog,
@@ -503,6 +503,7 @@ pub fn flush_delta(index_dir: &Path, config: WriterConfig, verbose: bool) -> Res
     for delta in &delta_catalog {
         let data = read_file_range(&delta.path, delta.start_offset, delta.end_offset)?;
         let path_string = delta.path.to_string_lossy().into_owned();
+        let project_id = project_id_for_path(&delta.path);
         let mut entry = CatalogEntry {
             file_id: delta.file_id,
             kind: String::new(),
@@ -518,6 +519,7 @@ pub fn flush_delta(index_dir: &Path, config: WriterConfig, verbose: bool) -> Res
             &data,
             delta.start_offset,
             &path_string,
+            &project_id,
         )?;
     }
     commit_targets("main", targets, verbose)?;
