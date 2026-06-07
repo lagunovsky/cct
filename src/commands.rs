@@ -308,19 +308,24 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     }
     let render_elapsed = render_start.elapsed();
 
+    let mut delta_optimize_error: Option<String> = None;
+    let delta_optimize_elapsed = match optimize_delta(&index_dir, WriterConfig::for_delta_update()) {
+        Ok(elapsed) => elapsed,
+        Err(err) => {
+            delta_optimize_error = Some(format!("{err:#}"));
+            None
+        }
+    };
+
     let elapsed = start.elapsed();
     let breakdown = if args.verbose >= 2 {
-        let mut parts: Vec<(&str, Duration)> = Vec::new();
-        if scan_elapsed.as_millis() >= 5 {
-            parts.push(("scan", scan_elapsed));
-        }
-        if update_elapsed.as_millis() >= 5 {
-            parts.push(("update", update_elapsed));
-        }
-        parts.push(("search", search_elapsed));
-        if render_elapsed.as_millis() >= 5 {
-            parts.push(("render", render_elapsed));
-        }
+        let parts = search_timing_parts(
+            scan_elapsed,
+            update_elapsed,
+            search_elapsed,
+            render_elapsed,
+            delta_optimize_elapsed,
+        );
         if parts.len() > 1 {
             format!("{DIM} ({}){RESET}", format_timing_parts(&parts))
         } else {
@@ -333,16 +338,41 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         "\n{DIM}{count} sessions in {elapsed:?}{RESET}{breakdown}",
         count = to_show,
     );
-    match optimize_delta(&index_dir, WriterConfig::for_delta_update()) {
-        Ok(Some(delta_elapsed))
-            if args.verbose >= 2 || delta_elapsed >= Duration::from_secs(1) =>
-        {
-            println!("{DIM}delta optimize {delta_elapsed:?}{RESET}");
+    if args.verbose < 2 {
+        if let Some(delta_elapsed) = delta_optimize_elapsed {
+            if delta_elapsed >= Duration::from_secs(1) {
+                println!("{DIM}delta optimize {delta_elapsed:?}{RESET}");
+            }
         }
-        Ok(_) => {}
-        Err(err) => eprintln!("{DIM}delta optimize skipped: {err:#}{RESET}"),
+    }
+    if let Some(err) = delta_optimize_error {
+        eprintln!("{DIM}delta optimize skipped: {err}{RESET}");
     }
     Ok(())
+}
+
+fn search_timing_parts(
+    scan_elapsed: Duration,
+    update_elapsed: Duration,
+    search_elapsed: Duration,
+    render_elapsed: Duration,
+    delta_optimize_elapsed: Option<Duration>,
+) -> Vec<(&'static str, Duration)> {
+    let mut parts: Vec<(&'static str, Duration)> = Vec::new();
+    if scan_elapsed.as_millis() >= 5 {
+        parts.push(("scan", scan_elapsed));
+    }
+    if update_elapsed.as_millis() >= 5 {
+        parts.push(("update", update_elapsed));
+    }
+    parts.push(("search", search_elapsed));
+    if render_elapsed.as_millis() >= 5 {
+        parts.push(("render", render_elapsed));
+    }
+    if let Some(delta_elapsed) = delta_optimize_elapsed {
+        parts.push(("delta optimize", delta_elapsed));
+    }
+    parts
 }
 
 fn format_timing_parts(parts: &[(&str, Duration)]) -> String {
@@ -424,6 +454,26 @@ fn compute_session_stats(session: &search::SessionResult) -> search::DisplayStat
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_timing_parts_include_delta_optimize_when_it_ran() {
+        let parts = search_timing_parts(
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Duration::from_millis(2),
+            Duration::from_millis(1),
+            Some(Duration::from_millis(3)),
+        );
+        let labels: Vec<&str> = parts.iter().map(|(label, _)| *label).collect();
+
+        assert_eq!(labels, vec!["search", "delta optimize"]);
+        assert!(format_timing_parts(&parts).contains("delta optimize 3.00ms"));
+    }
 }
 
 fn compute_session_stats_parallel(
