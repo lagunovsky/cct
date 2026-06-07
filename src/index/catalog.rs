@@ -10,8 +10,6 @@ use anyhow::{bail, Context, Result};
 use super::schema::IndexKind;
 use super::writer::WriterConfig;
 
-const CATALOG_HEADER_V1: &str =
-    "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tpath";
 const CATALOG_HEADER: &str =
     "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tprompts\ttools\tdisplay_bytes\tpath";
 const DELTA_CATALOG_HEADER: &str =
@@ -72,25 +70,20 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let mut lines = raw.lines();
     let header = lines.next().unwrap_or_default();
-    let has_display_stats = match header {
-        CATALOG_HEADER => true,
-        CATALOG_HEADER_V1 => false,
-        _ => {
-            bail!(
-                "catalog schema is old or incompatible: {}\nRebuild with `cct reindex`.",
-                path.display()
-            );
-        }
-    };
+    if header != CATALOG_HEADER {
+        bail!(
+            "catalog schema is old or incompatible: {}\nRebuild with `cct reindex`.",
+            path.display()
+        );
+    }
 
     let mut entries = Vec::new();
     for (line_no, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let expected_parts = if has_display_stats { 10 } else { 7 };
-        let parts: Vec<&str> = line.splitn(expected_parts, '\t').collect();
-        if parts.len() != expected_parts {
+        let parts: Vec<&str> = line.splitn(10, '\t').collect();
+        if parts.len() != 10 {
             bail!("bad catalog line {} in {}", line_no + 2, path.display());
         }
         entries.push(CatalogEntry {
@@ -110,26 +103,10 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
             next_chunk_id: parts[5]
                 .parse()
                 .with_context(|| format!("bad next_chunk_id at catalog line {}", line_no + 2))?,
-            prompts: if has_display_stats {
-                parse_optional_u32(parts[6], "prompts", line_no + 2)?
-            } else {
-                None
-            },
-            tools: if has_display_stats {
-                parse_optional_u32(parts[7], "tools", line_no + 2)?
-            } else {
-                None
-            },
-            display_bytes: if has_display_stats {
-                parse_optional_u64(parts[8], "display_bytes", line_no + 2)?
-            } else {
-                None
-            },
-            path: PathBuf::from(if has_display_stats {
-                parts[9]
-            } else {
-                parts[6]
-            }),
+            prompts: parse_optional_u32(parts[6], "prompts", line_no + 2)?,
+            tools: parse_optional_u32(parts[7], "tools", line_no + 2)?,
+            display_bytes: parse_optional_u64(parts[8], "display_bytes", line_no + 2)?,
+            path: PathBuf::from(parts[9]),
         });
     }
     Ok(entries)

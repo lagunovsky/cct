@@ -54,7 +54,7 @@ impl IndexKind {
 pub struct Fields {
     pub file_id: Field,
     pub chunk_id: Field,
-    pub project_id: Option<Field>,
+    pub project_id: Field,
     pub path: Field,
     pub start_offset: Field,
     pub end_offset: Field,
@@ -81,7 +81,7 @@ pub fn schema_and_fields(kind: IndexKind) -> (Schema, Fields) {
         Fields {
             file_id,
             chunk_id,
-            project_id: Some(project_id),
+            project_id,
             path,
             start_offset,
             end_offset,
@@ -94,7 +94,7 @@ pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
     Ok(Fields {
         file_id: schema.get_field("file_id")?,
         chunk_id: schema.get_field("chunk_id")?,
-        project_id: schema.get_field("project_id").ok(),
+        project_id: schema.get_field("project_id")?,
         path: schema.get_field("path")?,
         start_offset: schema.get_field("start_offset")?,
         end_offset: schema.get_field("end_offset")?,

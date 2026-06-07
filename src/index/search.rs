@@ -133,8 +133,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     let kinds = select_indexes(opts.mode, &opts.query);
 
     let mut hits: Vec<DocHit> = Vec::new();
-    let exact_filter_limit = candidate_limit(opts.limit, false);
-    let fallback_limit = candidate_limit(opts.limit, opts.project_prefix.is_some());
+    let limit = candidate_limit(opts.limit);
     let project_id = opts
         .project_prefix
         .as_ref()
@@ -151,8 +150,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
                 *kind,
                 &opts.query,
                 project_id.as_deref(),
-                exact_filter_limit,
-                fallback_limit,
+                limit,
             ) {
                 Ok(rows) => hits.extend(rows),
                 Err(err) => eprintln!("  warning: {} search failed: {err:#}", kind.as_str()),
@@ -179,13 +177,8 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     Ok(sessions)
 }
 
-fn candidate_limit(user_limit: usize, scoped_project: bool) -> usize {
-    let base = user_limit.saturating_mul(8).max(user_limit.max(64));
-    if scoped_project {
-        base.max(10_000)
-    } else {
-        base
-    }
+fn candidate_limit(user_limit: usize) -> usize {
+    user_limit.saturating_mul(8).max(user_limit.max(64))
 }
 
 fn group_hits_by_file(hits: Vec<DocHit>) -> BTreeMap<PathBuf, Vec<DocHit>> {
@@ -673,8 +666,7 @@ fn search_one_index(
     kind: IndexKind,
     query_text: &str,
     project_id: Option<&str>,
-    exact_filter_limit: usize,
-    fallback_limit: usize,
+    limit: usize,
 ) -> Result<Vec<DocHit>> {
     let dir = subindex_dir(root, kind);
     let index =
@@ -684,12 +676,6 @@ fn search_one_index(
     let fields = fields_from_schema(&schema)?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
-    let exact_project_filter = project_id.is_some() && fields.project_id.is_some();
-    let limit = if exact_project_filter {
-        exact_filter_limit
-    } else {
-        fallback_limit
-    };
     let query = build_query(kind, &fields, query_text, project_id)?;
     let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
 
@@ -740,8 +726,8 @@ fn build_query(
             (Occur::Must, q)
         })
         .collect();
-    if let (Some(project_field), Some(project_id)) = (fields.project_id, project_id) {
-        let term = Term::from_field_text(project_field, project_id);
+    if let Some(project_id) = project_id {
+        let term = Term::from_field_text(fields.project_id, project_id);
         let q: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
         clauses.push((Occur::Must, q));
     }

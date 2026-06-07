@@ -384,9 +384,7 @@ pub fn add_content_bytes(
             let mut document = TantivyDocument::new();
             document.add_u64(target.fields.file_id, entry.file_id);
             document.add_u64(target.fields.chunk_id, chunk_id);
-            if let Some(project_field) = target.fields.project_id {
-                document.add_text(project_field, project_id);
-            }
+            document.add_text(target.fields.project_id, project_id);
             document.add_text(target.fields.path, path_string);
             document.add_u64(target.fields.start_offset, start_offset);
             document.add_u64(target.fields.end_offset, end_offset);
@@ -411,9 +409,7 @@ pub fn add_path_document(
     let mut document = TantivyDocument::new();
     document.add_u64(target.fields.file_id, entry.file_id);
     document.add_u64(target.fields.chunk_id, 0u64);
-    if let Some(project_field) = target.fields.project_id {
-        document.add_text(project_field, project_id);
-    }
+    document.add_text(target.fields.project_id, project_id);
     document.add_text(target.fields.path, path_string);
     document.add_u64(target.fields.start_offset, 0u64);
     document.add_u64(target.fields.end_offset, entry.size);
