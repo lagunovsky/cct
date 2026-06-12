@@ -125,8 +125,6 @@ pub fn run_full_reindex(
             indexed_chunks
         );
     }
-    let catalog_path = write_catalog(index_dir, &catalog_entries)?;
-
     for target in &mut targets {
         let phase = Instant::now();
         if verbose {
@@ -156,6 +154,10 @@ pub fn run_full_reindex(
         }
     }
 
+    // The catalog is written only after every subindex has committed: a crash
+    // mid-commit must not leave a "complete" catalog over an empty index,
+    // which would make incremental updates report "unchanged" forever.
+    let catalog_path = write_catalog(index_dir, &catalog_entries)?;
     write_manifest(index_dir, source, indexed, total_bytes, enabled, config)?;
 
     if verbose {
