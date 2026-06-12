@@ -44,6 +44,7 @@ impl ArchiveFixture {
             project: None,
             dry_run: false,
             skip_confirm: true,
+            quiet: false,
         }
     }
 

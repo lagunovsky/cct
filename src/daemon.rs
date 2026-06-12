@@ -97,7 +97,23 @@ pub fn run_background_update() -> Result<()> {
     if !on_ac_power() {
         return Ok(());
     }
-    commands::run_silent_update(&index_root()?)
+    commands::run_silent_update(&index_root()?)?;
+    // Opt-in background archiving (`cct archive --auto <age>`). Runs after
+    // the update+flush above, so archived tails are already in the main index.
+    if let Some(days) = crate::config::auto_archive_days() {
+        crate::archive::run_archive(crate::archive::ArchiveOptions {
+            older_than_days: days,
+            project: None,
+            dry_run: false,
+            skip_confirm: true,
+            quiet: true,
+        })?;
+    }
+    Ok(())
+}
+
+pub fn daemon_installed() -> bool {
+    plist_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]

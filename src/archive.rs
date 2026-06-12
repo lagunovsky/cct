@@ -146,6 +146,8 @@ pub struct ArchiveOptions {
     pub project: Option<PathBuf>,
     pub dry_run: bool,
     pub skip_confirm: bool,
+    /// Daemon mode: print nothing unless something was archived or failed.
+    pub quiet: bool,
 }
 
 pub fn run_archive(opts: ArchiveOptions) -> Result<()> {
@@ -191,23 +193,27 @@ pub fn run_archive_in(opts: ArchiveOptions, projects: &Path, archive: &Path) -> 
         collect_cold_sessions(dir, cutoff_ms, &mut cold)?;
     }
     if cold.is_empty() {
-        println!(
-            "Nothing to archive: no sessions older than {} days.",
-            opts.older_than_days
-        );
+        if !opts.quiet {
+            println!(
+                "Nothing to archive: no sessions older than {} days.",
+                opts.older_than_days
+            );
+        }
         return Ok(());
     }
     cold.sort_by_key(|s| s.last_activity_ms);
 
     let total_bytes: u64 = cold.iter().map(|s| s.bytes).sum();
-    println!(
-        "{BOLD}Archive {} session(s) older than {} days{RESET} ({} on disk)",
-        cold.len(),
-        opts.older_than_days,
-        fmt_size(total_bytes)
-    );
-    println!("  from: {}", projects.display());
-    println!("  to:   {} {DIM}(zstd){RESET}", archive.display());
+    if !opts.quiet {
+        println!(
+            "{BOLD}Archive {} session(s) older than {} days{RESET} ({} on disk)",
+            cold.len(),
+            opts.older_than_days,
+            fmt_size(total_bytes)
+        );
+        println!("  from: {}", projects.display());
+        println!("  to:   {} {DIM}(zstd){RESET}", archive.display());
+    }
     if opts.dry_run {
         for s in &cold {
             println!("  - {}  {DIM}{}{RESET}", s.id, fmt_size(s.bytes));
@@ -238,18 +244,20 @@ pub fn run_archive_in(opts: ArchiveOptions, projects: &Path, archive: &Path) -> 
         }
     }
 
-    println!(
-        "\n{GREEN}Done.{RESET} Archived {archived}/{} session(s): {} → {} ({:.1}x)",
-        cold.len(),
-        fmt_size(archived_bytes),
-        fmt_size(compressed_bytes),
-        if compressed_bytes > 0 {
-            archived_bytes as f64 / compressed_bytes as f64
-        } else {
-            0.0
-        }
-    );
-    println!("{DIM}Restore with: cct unarchive <id>{RESET}");
+    if !opts.quiet || archived > 0 || !failed.is_empty() {
+        println!(
+            "\n{GREEN}Done.{RESET} Archived {archived}/{} session(s): {} → {} ({:.1}x)",
+            cold.len(),
+            fmt_size(archived_bytes),
+            fmt_size(compressed_bytes),
+            if compressed_bytes > 0 {
+                archived_bytes as f64 / compressed_bytes as f64
+            } else {
+                0.0
+            }
+        );
+        println!("{DIM}Restore with: cct unarchive <id>{RESET}");
+    }
     if !failed.is_empty() {
         println!("\n{RED}Errors:{RESET}");
         for e in &failed {

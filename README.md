@@ -193,7 +193,7 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 | `cct daemon uninstall` | Remove launchd job |
 | `cct daemon update` | Background update entry point used by launchd |
 | `cct cleanup-period [days]` | Show or set Claude Code's transcript retention (`cleanupPeriodDays` in `~/.claude/settings.json`); flags: `--no-warn`, `--warn` |
-| `cct archive` | Move cold sessions into `~/.claude/archive` (zstd); flags: `--older-than` (default 90d), `-p`, `--dry-run`, `-y` |
+| `cct archive` | Move cold sessions into `~/.claude/archive` (zstd); flags: `--older-than` (default 90d), `-p`, `--dry-run`, `-y`, `--auto <age\|off>` |
 | `cct unarchive <ids...>` | Restore archived sessions back into `~/.claude/projects`; flag: `--keep-mtime` |
 
 ## Archiving
@@ -207,6 +207,11 @@ Restoring with `cct unarchive <id>` brings the session back for
 `claude --resume`; the restored file gets a fresh mtime so Claude Code's
 age-based cleanup doesn't immediately reap it (pass `--keep-mtime` to
 preserve the original timestamp instead — at your own cleanup risk).
+
+Background archiving is opt-in: `cct archive --auto 90d` makes the launchd
+daemon archive cold sessions after each background index update
+(`cct archive --auto off` disables; the setting lives in
+`~/.config/cct/config`).
 
 Limitations: archived sessions don't appear in `cct recent` or the transfer
 picker, and `cct rename`/`cct transfer` skip them — unarchive first.

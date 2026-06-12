@@ -47,6 +47,23 @@ pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
 }
 
 fn run_archive_cmd(args: cli::ArchiveCmd) -> Result<()> {
+    if let Some(auto) = args.auto.as_deref() {
+        if auto == "off" {
+            let path = crate::config::set_auto_archive("off")?;
+            println!("Background archiving disabled ({}).", path.display());
+        } else {
+            let days = crate::archive::parse_age_days(auto)?;
+            let path = crate::config::set_auto_archive(auto)?;
+            println!(
+                "Background archiving enabled: the daemon will archive sessions older than {days} days ({}).",
+                path.display()
+            );
+            if !crate::daemon::daemon_installed() {
+                println!("{DIM}Note: the daemon is not installed — run `cct daemon install`.{RESET}");
+            }
+        }
+        return Ok(());
+    }
     let older_than_days = crate::archive::parse_age_days(&args.older_than)?;
     let project = args
         .project
@@ -69,6 +86,7 @@ fn run_archive_cmd(args: cli::ArchiveCmd) -> Result<()> {
         project,
         dry_run: args.dry_run,
         skip_confirm: args.yes,
+        quiet: false,
     })
 }
 

@@ -259,6 +259,12 @@ pub struct ArchiveCmd {
     /// Skip the y/N prompt.
     #[arg(short = 'y', long = "yes", default_value_t = false)]
     pub yes: bool,
+
+    /// Configure background archiving by the daemon: an age (90d, 6m, 1y) to
+    /// enable, or `off` to disable. Stored in ~/.config/cct/config; nothing
+    /// is archived right now.
+    #[arg(long = "auto", value_name = "AGE|off")]
+    pub auto: Option<String>,
 }
 
 #[derive(Args, Debug)]

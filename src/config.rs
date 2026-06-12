@@ -15,6 +15,7 @@ pub const CLAUDE_DEFAULT_CLEANUP_DAYS: u64 = 30;
 pub const CLEANUP_WARN_THRESHOLD_DAYS: u64 = 90;
 
 const CLEANUP_WARNING_KEY: &str = "cleanup_warning";
+const AUTO_ARCHIVE_KEY: &str = "auto_archive";
 
 pub fn config_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
@@ -79,6 +80,24 @@ pub fn cleanup_warning_enabled() -> bool {
 
 pub fn set_cleanup_warning(enabled: bool) -> Result<PathBuf> {
     set_config_value(CLEANUP_WARNING_KEY, if enabled { "on" } else { "off" })
+}
+
+/// Background-archiving age threshold in days; None = disabled (default).
+/// Set via `cct archive --auto 90d`, stored as the raw form (`90d`).
+pub fn auto_archive_days() -> Option<u64> {
+    auto_archive_days_from(&read_config())
+}
+
+fn auto_archive_days_from(map: &BTreeMap<String, String>) -> Option<u64> {
+    let raw = map.get(AUTO_ARCHIVE_KEY)?;
+    if raw == "off" {
+        return None;
+    }
+    crate::archive::parse_age_days(raw).ok()
+}
+
+pub fn set_auto_archive(raw: &str) -> Result<PathBuf> {
+    set_config_value(AUTO_ARCHIVE_KEY, raw)
 }
 
 pub fn claude_settings_path() -> Result<PathBuf> {
@@ -158,6 +177,20 @@ mod tests {
         let map = read_config_at(&path);
         assert_eq!(map.get("alpha").map(String::as_str), Some("2"));
         assert_eq!(map.get("cleanup_warning").map(String::as_str), Some("off"));
+    }
+
+    #[test]
+    fn auto_archive_parsing_from_config_map() {
+        let mut map = BTreeMap::new();
+        assert_eq!(auto_archive_days_from(&map), None, "unset = disabled");
+        map.insert("auto_archive".to_string(), "90d".to_string());
+        assert_eq!(auto_archive_days_from(&map), Some(90));
+        map.insert("auto_archive".to_string(), "6m".to_string());
+        assert_eq!(auto_archive_days_from(&map), Some(180));
+        map.insert("auto_archive".to_string(), "off".to_string());
+        assert_eq!(auto_archive_days_from(&map), None);
+        map.insert("auto_archive".to_string(), "garbage".to_string());
+        assert_eq!(auto_archive_days_from(&map), None, "bad value = disabled");
     }
 
     #[test]
