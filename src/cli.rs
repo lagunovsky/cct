@@ -17,6 +17,34 @@ pub struct Cli {
     pub command: Option<Cmd>,
 }
 
+/// Every subcommand name and visible alias the parser recognizes, plus `help`.
+/// Kept in sync with `Cmd`; `normalize_args` uses it to decide whether a bare
+/// first argument is an implicit search query rather than a (mistyped) command.
+pub const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "recent", "r", "search", "s", "reindex", "ri", "update", "u", "compact", "c", "rename", "rn",
+    "transfer", "tr", "daemon", "d", "help",
+];
+
+/// Treat a bare first argument that is neither a flag nor a known subcommand as
+/// an implicit `search` query, so `cct ветка` behaves like `cct search ветка`.
+/// `args` is the full argv (program name included); returns it unchanged in
+/// every other case.
+pub fn normalize_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args: Vec<String> = args.into_iter().map(Into::into).collect();
+    let Some(first) = args.get(1) else {
+        return args;
+    };
+    if first.starts_with('-') || KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
+        return args;
+    }
+    args.insert(1, "search".to_string());
+    args
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Recent sessions in current project (default).
@@ -220,4 +248,50 @@ pub fn parse_index_list(raw: &str) -> Option<BTreeSet<IndexKind>> {
         }
     }
     Some(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn norm(args: &[&str]) -> Vec<String> {
+        normalize_args(args.iter().copied())
+    }
+
+    #[test]
+    fn bare_query_becomes_implicit_search() {
+        assert_eq!(norm(&["cct", "ветка"]), vec!["cct", "search", "ветка"]);
+        assert_eq!(
+            norm(&["cct", "ветка", "-g"]),
+            vec!["cct", "search", "ветка", "-g"]
+        );
+    }
+
+    #[test]
+    fn known_commands_aliases_and_flags_pass_through() {
+        for cmd in ["search", "s", "reindex", "ri", "transfer", "tr", "daemon", "help"] {
+            assert_eq!(norm(&["cct", cmd]), vec!["cct", cmd]);
+        }
+        // Flags and the no-argument case are never rewritten.
+        assert_eq!(norm(&["cct", "-h"]), vec!["cct", "-h"]);
+        assert_eq!(norm(&["cct"]), vec!["cct"]);
+    }
+
+    #[test]
+    fn known_subcommands_list_stays_in_sync_with_cmd() {
+        for sub in Cli::command().get_subcommands() {
+            assert!(
+                KNOWN_SUBCOMMANDS.contains(&sub.get_name()),
+                "KNOWN_SUBCOMMANDS missing command name {:?}",
+                sub.get_name()
+            );
+            for alias in sub.get_visible_aliases() {
+                assert!(
+                    KNOWN_SUBCOMMANDS.contains(&alias),
+                    "KNOWN_SUBCOMMANDS missing alias {alias:?}"
+                );
+            }
+        }
+    }
 }
