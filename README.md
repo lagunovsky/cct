@@ -192,6 +192,15 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 | `cct daemon install` | Install launchd job for background indexing every 30 min on AC power |
 | `cct daemon uninstall` | Remove launchd job |
 | `cct daemon update` | Background update entry point used by launchd |
+| `cct cleanup-period [days]` | Show or set Claude Code's transcript retention (`cleanupPeriodDays` in `~/.claude/settings.json`); flags: `--no-warn`, `--warn` |
+
+## Session retention
+
+Claude Code deletes session transcripts after 30 days by default
+(`cleanupPeriodDays`), which silently shrinks searchable history. Reindexing
+warns when retention is below 90 days; raise it with `cct cleanup-period 3650`
+or silence the warning with `cct cleanup-period --no-warn` (the choice is
+stored in `~/.config/cct/config`).
 
 ## Trade-offs / non-goals
 

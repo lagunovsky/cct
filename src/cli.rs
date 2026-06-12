@@ -21,8 +21,25 @@ pub struct Cli {
 /// Kept in sync with `Cmd`; `normalize_args` uses it to decide whether a bare
 /// first argument is an implicit search query rather than a (mistyped) command.
 pub const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "recent", "r", "search", "s", "reindex", "ri", "update", "u", "compact", "c", "rename", "rn",
-    "transfer", "tr", "daemon", "d", "help",
+    "recent",
+    "r",
+    "search",
+    "s",
+    "reindex",
+    "ri",
+    "update",
+    "u",
+    "compact",
+    "c",
+    "rename",
+    "rn",
+    "transfer",
+    "tr",
+    "daemon",
+    "d",
+    "cleanup-period",
+    "cp",
+    "help",
 ];
 
 /// Treat a bare first argument that is neither a flag nor a known subcommand as
@@ -78,6 +95,10 @@ pub enum Cmd {
     /// Manage launchd background indexing (macOS).
     #[command(visible_alias = "d")]
     Daemon(DaemonCmd),
+
+    /// Show or set Claude Code's session retention (cleanupPeriodDays).
+    #[command(visible_alias = "cp", name = "cleanup-period")]
+    CleanupPeriod(CleanupPeriodCmd),
 }
 
 #[derive(Args, Debug)]
@@ -211,6 +232,21 @@ pub struct TransferCmd {
     /// Optional session ids (UUIDs or unique prefixes). Without ids: interactive picker.
     #[arg(num_args = 0..)]
     pub session_ids: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct CleanupPeriodCmd {
+    /// Days to retain transcripts; writes cleanupPeriodDays to
+    /// ~/.claude/settings.json. Omit to show the current value.
+    pub days: Option<u64>,
+
+    /// Permanently silence the low-retention warning (stored in ~/.config/cct/config).
+    #[arg(long = "no-warn", default_value_t = false)]
+    pub no_warn: bool,
+
+    /// Re-enable the low-retention warning.
+    #[arg(long = "warn", default_value_t = false, conflicts_with = "no_warn")]
+    pub warn: bool,
 }
 
 #[derive(Args, Debug)]

@@ -38,7 +38,73 @@ pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
             cli::DaemonAction::Uninstall => crate::daemon::uninstall_daemon(),
             cli::DaemonAction::Update => crate::daemon::run_background_update(),
         },
+        Some(cli::Cmd::CleanupPeriod(args)) => run_cleanup_period(args),
     }
+}
+
+fn run_cleanup_period(args: cli::CleanupPeriodCmd) -> Result<()> {
+    use crate::config;
+    if args.no_warn {
+        let path = config::set_cleanup_warning(false)?;
+        println!("Low-retention warning disabled ({}).", path.display());
+    } else if args.warn {
+        let path = config::set_cleanup_warning(true)?;
+        println!("Low-retention warning enabled ({}).", path.display());
+    }
+    if let Some(days) = args.days {
+        let path = config::write_cleanup_period_days(days)?;
+        println!(
+            "cleanupPeriodDays = {days} written to {}.\nClaude Code now retains session transcripts for {days} days.",
+            path.display()
+        );
+        return Ok(());
+    }
+    if args.no_warn || args.warn {
+        return Ok(());
+    }
+
+    let configured = config::read_cleanup_period_days()?;
+    match configured {
+        Some(days) => println!(
+            "cleanupPeriodDays = {days} ({})",
+            config::claude_settings_path()?.display()
+        ),
+        None => println!(
+            "cleanupPeriodDays is not set — Claude Code uses its default of {} days.",
+            config::CLAUDE_DEFAULT_CLEANUP_DAYS
+        ),
+    }
+    println!("Set it with: cct cleanup-period <days>   (e.g. cct cleanup-period 3650)");
+    if !config::cleanup_warning_enabled() {
+        println!("{DIM}Low-retention warning: disabled (cct cleanup-period --warn to re-enable){RESET}");
+    }
+    Ok(())
+}
+
+/// Warn when Claude Code's retention is short enough that indexed sessions
+/// will be deleted from under the index. Shown by reindex paths; silenceable
+/// via `cct cleanup-period --no-warn`.
+fn maybe_warn_short_cleanup_period() {
+    use crate::config;
+    if !config::cleanup_warning_enabled() {
+        return;
+    }
+    let configured = config::read_cleanup_period_days().ok().flatten();
+    let days = configured.unwrap_or(config::CLAUDE_DEFAULT_CLEANUP_DAYS);
+    if days >= config::CLEANUP_WARN_THRESHOLD_DAYS {
+        return;
+    }
+    let source = if configured.is_some() {
+        "cleanupPeriodDays"
+    } else {
+        "cleanupPeriodDays default"
+    };
+    eprintln!(
+        "\n{BOLD}⚠ Claude Code deletes session transcripts after {days} days{RESET} ({source}).\n\
+         Old sessions disappear from disk — and from this index — as they expire.\n\
+         {DIM}Raise retention:  cct cleanup-period 3650   (writes ~/.claude/settings.json){RESET}\n\
+         {DIM}Silence warning:  cct cleanup-period --no-warn{RESET}\n"
+    );
 }
 
 fn parse_only(raw: Option<&str>) -> Result<Option<BTreeSet<IndexKind>>> {
@@ -99,6 +165,7 @@ fn writer_config_for_compact(args: &cli::CompactCmd) -> Result<WriterConfig> {
 }
 
 pub fn run_reindex(args: cli::ReindexCmd) -> Result<()> {
+    maybe_warn_short_cleanup_period();
     let config = writer_config_for_reindex(&args)?;
     let only = parse_only(args.only.as_deref())?;
     let enabled = only.unwrap_or_else(IndexKind::all);
@@ -215,6 +282,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         // Released before the read-only search below; readers are not locked.
         let _lock = lock_index_exclusive(&index_dir)?;
         if !index_dir.exists() {
+            maybe_warn_short_cleanup_period();
             eprintln!("{DIM}Building initial index — this may take a while...{RESET}");
             let config = WriterConfig::for_full_reindex();
             let files = collect_cct_layout(&source)?;
