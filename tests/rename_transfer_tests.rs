@@ -319,6 +319,60 @@ fn transfer_resolves_session_by_title() -> Result<()> {
 }
 
 #[test]
+fn transfer_resolves_title_containing_comma() -> Result<()> {
+    let fx = WorkspaceFixture::new()?;
+    let src = fx.make_project("srccomma", &[("eeee5555", "comma titled")])?;
+    let dst = fx.work.join("dstcomma");
+    fs::create_dir_all(&dst)?;
+
+    let src_sess = fx.session_dir_for(&src);
+    let file = src_sess.join("eeee5555.jsonl");
+    let mut content = read_to_string(&file);
+    content.push_str(
+        r#"{"type":"custom-title","customTitle":"fix auth, cleanup","sessionId":"eeee5555"}"#,
+    );
+    content.push('\n');
+    fs::write(&file, content)?;
+
+    transfer_sessions_in(
+        &["fix auth, cleanup".to_string()],
+        &src,
+        &dst,
+        false,
+        &fx.projects,
+    )?;
+
+    assert!(fx
+        .session_dir_for(&dst)
+        .join("eeee5555.jsonl")
+        .exists());
+    Ok(())
+}
+
+#[test]
+fn transfer_duplicate_refs_to_same_session_succeed_once() -> Result<()> {
+    let fx = WorkspaceFixture::new()?;
+    let src = fx.make_project("srcdup", &[("ffff6666", "dup refs")])?;
+    let dst = fx.work.join("dstdup");
+    fs::create_dir_all(&dst)?;
+
+    // Two prefixes of the same id must not produce a phantom failure.
+    transfer_sessions_in(
+        &["ffff".to_string(), "ffff66".to_string()],
+        &src,
+        &dst,
+        false,
+        &fx.projects,
+    )?;
+
+    assert!(fx
+        .session_dir_for(&dst)
+        .join("ffff6666.jsonl")
+        .exists());
+    Ok(())
+}
+
+#[test]
 fn transfer_carries_subdirs_and_rewrites_their_files() -> Result<()> {
     let fx = WorkspaceFixture::new()?;
     let src = fx.make_project("src2", &[("ccc33333", "with subdir")])?;

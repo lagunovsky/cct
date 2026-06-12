@@ -26,15 +26,15 @@ pub fn run_transfer(args: TransferArgs) -> Result<()> {
     let src_abs = absolutize_lexical(&src_str)?;
     let dst_abs = absolutize_lexical(&args.target)?;
 
-    let mut ids: Vec<String> = Vec::new();
-    for raw in &args.session_args {
-        for p in raw.split(',') {
-            let trimmed = p.trim();
-            if !trimmed.is_empty() {
-                ids.push(trimmed.to_string());
-            }
-        }
-    }
+    // Keep arguments whole here: a session title set via /rename may itself
+    // contain commas. Comma-splitting happens during resolution, only when
+    // the whole argument doesn't match anything.
+    let mut ids: Vec<String> = args
+        .session_args
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let mut skip_confirm = args.skip_confirm;
     if ids.is_empty() {
@@ -152,9 +152,14 @@ fn pick_sessions_interactive(sessions: &[SessionEntry], src_abs: &Path) -> Resul
 }
 
 fn resolve_session_id(src_dir: &Path, q: &str) -> Result<String> {
-    let exact = src_dir.join(format!("{q}.jsonl"));
-    if exact.exists() {
-        return Ok(q.to_string());
+    // Only path-safe queries may hit the filesystem directly: an id like
+    // `../other/abc` would otherwise resolve to a file outside `src_dir` and
+    // later land the transferred session outside the target dir too.
+    if !q.contains(['/', '\\']) && q != "." && q != ".." {
+        let exact = src_dir.join(format!("{q}.jsonl"));
+        if exact.exists() {
+            return Ok(q.to_string());
+        }
     }
 
     // 1) Match by session id prefix — cheap, only inspects file names.
@@ -209,6 +214,32 @@ fn resolve_session_id(src_dir: &Path, q: &str) -> Result<String> {
     }
 }
 
+/// Resolve raw CLI arguments to session ids. Each argument is tried whole
+/// first (it may be a title containing commas); only when nothing matches is
+/// it treated as a comma-separated list of ids/prefixes/titles.
+fn resolve_session_args(src_dir: &Path, ids: &[String]) -> Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for raw in ids {
+        match resolve_session_id(src_dir, raw) {
+            Ok(id) => resolved.push(id),
+            Err(whole_err) => {
+                let parts: Vec<&str> = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.len() < 2 {
+                    return Err(whole_err);
+                }
+                for part in parts {
+                    resolved.push(resolve_session_id(src_dir, part)?);
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 struct PendingTransfer {
     id: String,
     src_jsonl: PathBuf,
@@ -252,8 +283,13 @@ pub fn transfer_sessions_in(
     let dst_bytes = dst_abs.to_string_lossy().as_bytes().to_vec();
 
     let mut pending: Vec<PendingTransfer> = Vec::new();
-    for raw in ids {
-        let id = resolve_session_id(&src_dir, raw)?;
+    let mut seen_ids = std::collections::BTreeSet::new();
+    for id in resolve_session_args(&src_dir, ids)? {
+        // Two prefixes (or a prefix and a title) can resolve to the same
+        // session; transferring it once is success, not an error.
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
         let src_jsonl = src_dir.join(format!("{id}.jsonl"));
         let dst_jsonl = dst_dir.join(format!("{id}.jsonl"));
         if dst_jsonl.exists() {
@@ -329,11 +365,16 @@ pub fn transfer_sessions_in(
             failed.push(format!("{} jsonl: {err}", p.id));
         }
         if p.has_subdir {
-            walk_files(&p.dst_subdir, &mut |fp| {
+            // One unreadable subdir must not abort the rewrite of the other
+            // already-moved sessions (their files would keep the old cwd).
+            let walked = walk_files(&p.dst_subdir, &mut |fp| {
                 if let Err(err) = replace_in_file(fp, &src_bytes, &dst_bytes) {
                     failed.push(format!("{}/{}: {err}", p.id, fp.display()));
                 }
-            })?;
+            });
+            if let Err(err) = walked {
+                failed.push(format!("{}: walk subdir: {err}", p.id));
+            }
         }
     }
 
