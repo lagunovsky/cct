@@ -154,6 +154,26 @@ fn walk_dir(dir: &Path, visit: &mut dyn FnMut(&Path)) -> Result<()> {
     Ok(())
 }
 
+/// True when the byte can continue a path segment name. A path reference
+/// match is only valid when the next byte is NOT one of these — otherwise
+/// `/Temp/foo` would also match inside `/Temp/foo2` or `/Temp/foo.bak`.
+/// A following `/` is fine: that's a reference to a path inside the project.
+fn extends_path_segment(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(b, b'-' | b'_' | b'.' | b'~' | b'+' | b'@' | b'#' | b'%' | b'=')
+        || b >= 0x80
+}
+
+fn is_path_ref_at(haystack: &[u8], i: usize, needle: &[u8]) -> bool {
+    if i + needle.len() > haystack.len() || &haystack[i..i + needle.len()] != needle {
+        return false;
+    }
+    match haystack.get(i + needle.len()) {
+        Some(&next) => !extends_path_segment(next),
+        None => true,
+    }
+}
+
 pub fn count_overlapping(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || needle.len() > haystack.len() {
         return 0;
@@ -161,7 +181,7 @@ pub fn count_overlapping(haystack: &[u8], needle: &[u8]) -> usize {
     let mut count = 0;
     let mut i = 0;
     while i + needle.len() <= haystack.len() {
-        if &haystack[i..i + needle.len()] == needle {
+        if is_path_ref_at(haystack, i, needle) {
             count += 1;
             i += needle.len();
         } else {
@@ -173,7 +193,7 @@ pub fn count_overlapping(haystack: &[u8], needle: &[u8]) -> usize {
 
 pub fn replace_in_file(path: &Path, old: &[u8], new: &[u8]) -> Result<()> {
     let data = fs::read(path)?;
-    if !contains_subslice(&data, old) {
+    if count_overlapping(&data, old) == 0 {
         return Ok(());
     }
     let updated = replace_all(&data, old, new);
@@ -183,18 +203,11 @@ pub fn replace_in_file(path: &Path, old: &[u8], new: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
 fn replace_all(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        if i + old.len() <= data.len() && &data[i..i + old.len()] == old {
+        if is_path_ref_at(data, i, old) {
             out.extend_from_slice(new);
             i += old.len();
         } else {

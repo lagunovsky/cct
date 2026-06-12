@@ -195,6 +195,48 @@ fn rename_with_move_dir_renames_project_dir_too() -> Result<()> {
 }
 
 #[test]
+fn rename_does_not_touch_sibling_paths_sharing_a_prefix() -> Result<()> {
+    let fx = WorkspaceFixture::new()?;
+    let old = fx.make_project("proj", &[("session-p", "main project")])?;
+    let sibling = fx.work.join("proj2");
+    let sibling_str = sibling.to_string_lossy().into_owned();
+    let new = fx.work.join("renamed");
+
+    // The session log also references the sibling project `proj2` and a path
+    // INSIDE the renamed project; only the latter may be rewritten.
+    let old_sess = fx.session_dir_for(&old);
+    let file = old_sess.join("session-p.jsonl");
+    let mut content = read_to_string(&file);
+    content.push_str(&format!(
+        r#"{{"type":"user","cwd":"{sibling_str}","message":{{"content":"see {inner}"}}}}"#,
+        inner = old.join("src/main.rs").display()
+    ));
+    content.push('\n');
+    fs::write(&file, content)?;
+
+    rename_project_in(
+        RenameArgs {
+            old_arg: old.to_string_lossy().into_owned(),
+            new_arg: new.to_string_lossy().into_owned(),
+            move_dir: false,
+            dry_run: false,
+        },
+        &fx.projects,
+    )?;
+
+    let body = read_to_string(&fx.session_dir_for(&new).join("session-p.jsonl"));
+    assert!(
+        body.contains(&sibling_str),
+        "sibling path proj2 must stay untouched: {body}"
+    );
+    assert!(
+        body.contains(&new.join("src/main.rs").to_string_lossy().into_owned()),
+        "path inside the project must be rewritten: {body}"
+    );
+    Ok(())
+}
+
+#[test]
 fn rename_refuses_when_target_session_dir_exists() -> Result<()> {
     let fx = WorkspaceFixture::new()?;
     let a = fx.make_project("a", &[("s1", "x")])?;
