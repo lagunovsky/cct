@@ -11,7 +11,7 @@ use super::schema::IndexKind;
 use super::writer::WriterConfig;
 
 const CATALOG_HEADER: &str =
-    "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tprompts\ttools\tdisplay_bytes\tpath";
+    "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tprompts\ttools\tdisplay_bytes\ttitle\tpath";
 const DELTA_CATALOG_HEADER: &str =
     "file_id\tstart_offset\tend_offset\tstart_chunk_id\tend_chunk_id\tpath";
 
@@ -26,6 +26,8 @@ pub struct CatalogEntry {
     pub prompts: Option<u32>,
     pub tools: Option<u32>,
     pub display_bytes: Option<u64>,
+    /// User-assigned session name (`/rename`); `None` when never named.
+    pub title: Option<String>,
     pub path: PathBuf,
 }
 
@@ -82,8 +84,8 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
         if line.trim().is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(10, '\t').collect();
-        if parts.len() != 10 {
+        let parts: Vec<&str> = line.splitn(11, '\t').collect();
+        if parts.len() != 11 {
             bail!("bad catalog line {} in {}", line_no + 2, path.display());
         }
         entries.push(CatalogEntry {
@@ -106,7 +108,12 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
             prompts: parse_optional_u32(parts[6], "prompts", line_no + 2)?,
             tools: parse_optional_u32(parts[7], "tools", line_no + 2)?,
             display_bytes: parse_optional_u64(parts[8], "display_bytes", line_no + 2)?,
-            path: PathBuf::from(parts[9]),
+            title: if parts[9].is_empty() {
+                None
+            } else {
+                Some(parts[9].to_string())
+            },
+            path: PathBuf::from(parts[10]),
         });
     }
     Ok(entries)
@@ -144,9 +151,16 @@ pub fn write_catalog(index_dir: &Path, entries: &[CatalogEntry]) -> Result<PathB
         let prompts = e.prompts.map(|n| n.to_string()).unwrap_or_default();
         let tools = e.tools.map(|n| n.to_string()).unwrap_or_default();
         let display_bytes = e.display_bytes.map(|n| n.to_string()).unwrap_or_default();
+        // Keep the TSV one-row-per-entry: tabs/newlines in a title would corrupt
+        // column parsing, so flatten them to spaces.
+        let title = e
+            .title
+            .as_deref()
+            .map(|t| t.replace(['\t', '\n', '\r'], " "))
+            .unwrap_or_default();
         writeln!(
             f,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             e.file_id,
             e.kind,
             e.size,
@@ -156,6 +170,7 @@ pub fn write_catalog(index_dir: &Path, entries: &[CatalogEntry]) -> Result<PathB
             prompts,
             tools,
             display_bytes,
+            title,
             e.path.to_string_lossy()
         )?;
     }

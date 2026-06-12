@@ -255,6 +255,7 @@ pub fn add_whole_file(
         prompts: None,
         tools: None,
         display_bytes: None,
+        title: title_for_file(&file.path, &data),
         path: file.path.clone(),
     };
 
@@ -330,6 +331,11 @@ pub fn append_file_tail(
     )?;
     if content.stats_available {
         append_entry_display_stats(entry, &file.path, content.stats, file.size);
+    }
+    // A `/rename` in the appended tail supersedes any earlier title; an append
+    // without one keeps the previously stored title.
+    if let Some(title) = title_for_file(&file.path, &data) {
+        entry.title = Some(title);
     }
 
     entry.kind = file.kind.as_str().to_string();
@@ -463,6 +469,14 @@ fn append_entry_display_stats(
 
 fn is_display_stats_file(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+}
+
+/// Session titles only live in `.jsonl` logs; skip tool-result sidecar files.
+fn title_for_file(path: &Path, data: &[u8]) -> Option<String> {
+    if !is_display_stats_file(path) {
+        return None;
+    }
+    crate::text::extract_session_title(data)
 }
 
 fn add_session_stats(total: &mut SessionStats, stats: SessionStats) {

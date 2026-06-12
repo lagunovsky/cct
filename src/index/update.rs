@@ -514,6 +514,7 @@ pub fn flush_delta(index_dir: &Path, config: WriterConfig, verbose: bool) -> Res
             prompts: None,
             tools: None,
             display_bytes: None,
+            title: None,
             path: delta.path.clone(),
         };
         let _content = add_content_bytes(
@@ -553,6 +554,7 @@ mod tests {
             prompts: None,
             tools: None,
             display_bytes: None,
+            title: None,
             path: PathBuf::from(path),
         }
     }

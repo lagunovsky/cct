@@ -78,6 +78,7 @@ pub struct SessionResult {
     pub snippets: Vec<Snippet>,
     pub last_msg_ms: i64,
     pub display_stats: Option<DisplayStats>,
+    pub title: Option<String>,
 }
 
 pub fn select_indexes(mode: SearchMode, query: &str) -> Vec<IndexKind> {
@@ -157,13 +158,13 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     }
 
     let groups = group_hits_by_file(hits);
-    let catalog_stats = load_catalog_display_stats(index_dir)?;
+    let catalog = load_catalog_render(index_dir)?;
     let by_session = build_session_results(
         groups,
         &opts.query,
         opts.context_chars,
         opts.fuzzy,
-        catalog_stats.as_ref(),
+        catalog.as_ref(),
     );
 
     let mut sessions: Vec<SessionResult> = by_session.into_values().collect();
@@ -195,7 +196,7 @@ fn build_session_results(
     query: &str,
     context_chars: usize,
     fuzzy: bool,
-    catalog_stats: Option<&BTreeMap<PathBuf, CatalogDisplayStats>>,
+    catalog: Option<&CatalogRender>,
 ) -> BTreeMap<String, SessionResult> {
     const MAX_SNIPPETS_PER_SESSION: usize = 10;
 
@@ -218,11 +219,19 @@ fn build_session_results(
                 files: BTreeSet::new(),
                 snippets: Vec::new(),
                 last_msg_ms: 0,
-                display_stats: catalog_stats.map(|_| DisplayStats::default()),
+                display_stats: catalog.map(|_| DisplayStats::default()),
+                title: None,
             });
         entry.sources.insert(source);
         entry.files.insert(path.clone());
-        apply_catalog_display_stats(entry, &path, catalog_stats);
+        apply_catalog_display_stats(entry, &path, catalog.map(|c| &c.stats));
+        if let Some(catalog) = catalog {
+            if entry.title.is_none() {
+                if let Some(title) = catalog.titles.get(&path) {
+                    entry.title = Some(title.clone());
+                }
+            }
+        }
         if entry.project == "?" && project != "?" {
             entry.project = project;
         }
@@ -257,19 +266,29 @@ fn build_session_results(
     by_session
 }
 
-fn load_catalog_display_stats(
-    index_dir: &Path,
-) -> Result<Option<BTreeMap<PathBuf, CatalogDisplayStats>>> {
+/// Per-file display data read once from the catalog: cached prompt/tool/byte
+/// stats and the user-assigned session title. Lets the renderer skip re-reading
+/// jsonl files.
+struct CatalogRender {
+    stats: BTreeMap<PathBuf, CatalogDisplayStats>,
+    titles: BTreeMap<PathBuf, String>,
+}
+
+fn load_catalog_render(index_dir: &Path) -> Result<Option<CatalogRender>> {
     if !catalog_path(index_dir).exists() {
         return Ok(None);
     }
-    let entries = read_catalog(index_dir)?;
-    Ok(Some(
-        entries
-            .into_iter()
-            .filter_map(|entry| entry.display_stats().map(|stats| (entry.path, stats)))
-            .collect(),
-    ))
+    let mut stats = BTreeMap::new();
+    let mut titles = BTreeMap::new();
+    for entry in read_catalog(index_dir)? {
+        if let Some(s) = entry.display_stats() {
+            stats.insert(entry.path.clone(), s);
+        }
+        if let Some(title) = entry.title {
+            titles.insert(entry.path, title);
+        }
+    }
+    Ok(Some(CatalogRender { stats, titles }))
 }
 
 fn apply_catalog_display_stats(
@@ -756,7 +775,7 @@ fn token_text(name: &str, text: &str) -> Result<Vec<String>> {
 
 /// Header line printed for each result before its snippets.
 pub fn print_session_header(s: &SessionResult, prompts: u32, tools: u32, bytes: u64) {
-    use crate::term::BOLD;
+    use crate::term::{BOLD, GREEN};
     let mut stats = String::new();
     if prompts > 0 || bytes > 0 {
         stats = format!(
@@ -764,8 +783,12 @@ pub fn print_session_header(s: &SessionResult, prompts: u32, tools: u32, bytes: 
             size = fmt_size(bytes)
         );
     }
+    let title = match &s.title {
+        Some(t) if !t.is_empty() => format!("  {GREEN}{BOLD}{t}{RESET}"),
+        _ => String::new(),
+    };
     println!(
-        "\n{CYAN}{BOLD}{id}{RESET}  {DIM}{project}{RESET}{stats}",
+        "\n{CYAN}{BOLD}{id}{RESET}{title}  {DIM}{project}{RESET}{stats}",
         id = s.session_id,
         project = s.project,
     );

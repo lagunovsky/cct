@@ -132,6 +132,13 @@ fn jsonl_assistant(text: &str) -> String {
     )
 }
 
+fn jsonl_custom_title(title: &str) -> String {
+    format!(
+        r#"{{"type":"custom-title","customTitle":"{}","sessionId":"x"}}"#,
+        title.replace('"', "\\\"")
+    )
+}
+
 fn assert_session(results: &[SessionResult], session_id: &str) {
     assert!(
         results.iter().any(|r| r.session_id == session_id),
@@ -176,6 +183,49 @@ fn reindex_finds_normal_word() -> Result<()> {
     assert_eq!(display.prompts, 1);
     assert_eq!(display.tools, 0);
     assert_eq!(display.bytes, fs::metadata(&session_path)?.len());
+    assert_eq!(session.title, None, "unnamed session has no title");
+    Ok(())
+}
+
+#[test]
+fn session_title_is_cached_and_last_rename_wins() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-named",
+        &format!(
+            "{}\n{}\n{}\n",
+            jsonl_user("titleterm here"),
+            jsonl_custom_title("first-name"),
+            jsonl_custom_title("final-name"),
+        ),
+    );
+    fx.full_reindex()?;
+
+    let entry = read_catalog(&fx.index_dir)?
+        .into_iter()
+        .find(|entry| entry.path == session_path)
+        .expect("session in catalog");
+    assert_eq!(entry.title.as_deref(), Some("final-name"));
+
+    let results = fx.search("titleterm", SearchMode::Auto);
+    let session = results
+        .iter()
+        .find(|r| r.session_id == "session-named")
+        .expect("session result");
+    assert_eq!(session.title.as_deref(), Some("final-name"));
+
+    // A later rename in an appended tail supersedes the cached title.
+    let mut content = fs::read_to_string(&session_path)?;
+    content.push_str(&jsonl_custom_title("renamed-again"));
+    content.push('\n');
+    fs::write(&session_path, content)?;
+    fx.update()?;
+
+    let entry = read_catalog(&fx.index_dir)?
+        .into_iter()
+        .find(|entry| entry.path == session_path)
+        .expect("session still in catalog");
+    assert_eq!(entry.title.as_deref(), Some("renamed-again"));
     Ok(())
 }
 

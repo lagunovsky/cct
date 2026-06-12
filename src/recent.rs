@@ -68,13 +68,14 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (prompts, total_prompts, tool_calls, bytes) = match load_session_summary(path, 2) {
-            Ok(v) => v,
-            Err(err) => {
-                println!("  {DIM}(error reading {session_id}: {err}){RESET}");
-                continue;
-            }
-        };
+        let (prompts, total_prompts, tool_calls, bytes, title) =
+            match load_session_summary(path, 2) {
+                Ok(v) => v,
+                Err(err) => {
+                    println!("  {DIM}(error reading {session_id}: {err}){RESET}");
+                    continue;
+                }
+            };
         print_session_summary(
             &session_id,
             *mtime_ms,
@@ -82,6 +83,7 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
             total_prompts,
             tool_calls,
             bytes,
+            title.as_deref(),
         );
     }
     Ok(())
@@ -129,10 +131,14 @@ pub fn session_activity_time_ms(path: &Path) -> i64 {
     }
 }
 
-/// Returns `(tail_pairs, total_prompts, tool_calls, bytes)`.
-fn load_session_summary(path: &Path, n: usize) -> Result<(Vec<PromptPair>, u32, u32, u64)> {
+/// Returns `(tail_pairs, total_prompts, tool_calls, bytes, title)`.
+fn load_session_summary(
+    path: &Path,
+    n: usize,
+) -> Result<(Vec<PromptPair>, u32, u32, u64, Option<String>)> {
     let data = fs::read(path)?;
     let bytes = data.len() as u64;
+    let title = crate::text::extract_session_title(&data);
     let mut pairs = Vec::new();
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut tool_calls = 0u32;
@@ -171,7 +177,7 @@ fn load_session_summary(path: &Path, n: usize) -> Result<(Vec<PromptPair>, u32, 
     if pairs.len() > n {
         pairs = pairs[pairs.len() - n..].to_vec();
     }
-    Ok((pairs, total, tool_calls, bytes))
+    Ok((pairs, total, tool_calls, bytes, title))
 }
 
 #[allow(clippy::type_complexity)]
@@ -274,6 +280,7 @@ fn print_session_summary(
     total_prompts: u32,
     tool_calls: u32,
     bytes: u64,
+    title: Option<&str>,
 ) {
     let when = if mtime_ms > 0 {
         chrono::DateTime::from_timestamp_millis(mtime_ms)
@@ -294,7 +301,11 @@ fn print_session_summary(
     } else {
         String::new()
     };
-    println!("\n{CYAN}{BOLD}{session_id}{RESET}  {DIM}{when}{RESET}{stats}");
+    let title = match title {
+        Some(t) if !t.is_empty() => format!("  {GREEN}{BOLD}{t}{RESET}"),
+        _ => String::new(),
+    };
+    println!("\n{CYAN}{BOLD}{session_id}{RESET}{title}  {DIM}{when}{RESET}{stats}");
     if prompts.is_empty() {
         println!("  {DIM}(no user prompts){RESET}");
         return;

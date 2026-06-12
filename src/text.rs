@@ -217,6 +217,39 @@ pub fn rewrite_slash_command(s: &str) -> Option<String> {
     }
 }
 
+/// The user-assigned session name set via `/rename`, stored in the log as a
+/// `{"type":"custom-title","customTitle":"…"}` record. A session can be renamed
+/// more than once, so the last non-empty title wins. Returns `None` when the
+/// session was never named.
+pub fn extract_session_title(data: &[u8]) -> Option<String> {
+    let mut title = None;
+    for line in data.split(|b| *b == b'\n') {
+        // Cheap byte prefilter so we only JSON-parse the rare title records.
+        if !slice_contains(line, b"\"custom-title\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<JsonValue>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("custom-title") {
+            continue;
+        }
+        if let Some(t) = value.get("customTitle").and_then(|t| t.as_str()) {
+            if !t.is_empty() {
+                title = Some(t.to_string());
+            }
+        }
+    }
+    title
+}
+
+fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Walk an arbitrary JSON value and collect all string values containing `query` (lowercased).
 pub fn find_json_values(line: &str, query_lower: &str) -> Vec<String> {
     let line = line.trim();
@@ -279,4 +312,34 @@ pub fn last_message_time_ms(data: &[u8]) -> i64 {
         end = next_end;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_session_title;
+
+    #[test]
+    fn extract_session_title_picks_last_custom_title() {
+        let data = concat!(
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"first","sessionId":"x"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"second","sessionId":"x"}"#,
+            "\n",
+        );
+        assert_eq!(extract_session_title(data.as_bytes()).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn extract_session_title_none_when_absent() {
+        let data = r#"{"type":"user","message":{"content":"no title here"}}"#;
+        assert_eq!(extract_session_title(data.as_bytes()), None);
+    }
+
+    #[test]
+    fn extract_session_title_ignores_empty() {
+        let data = r#"{"type":"custom-title","customTitle":"","sessionId":"x"}"#;
+        assert_eq!(extract_session_title(data.as_bytes()), None);
+    }
 }

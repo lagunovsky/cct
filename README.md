@@ -53,7 +53,7 @@ cct daemon uninstall
   word/         SimpleTokenizer + LowerCaser → natural-language queries, short tokens like "АД"
   trigram/      NgramTokenizer(3,3) + LowerCaser → APIError, traceback substrings
   path/         trigram over file paths
-  catalog.tsv   per-file row: file_id, kind, size, mtime_ms, indexed_offset, next_chunk_id, prompts, tools, display_bytes, path
+  catalog.tsv   per-file row: file_id, kind, size, mtime_ms, indexed_offset, next_chunk_id, prompts, tools, display_bytes, title, path
   manifest.txt  source dir, enabled indexes, writer config used to build it
 ```
 
@@ -100,6 +100,11 @@ even when the full phrase never appears on a single line.
 Slash-command invocations (`<command-name>/research</command-name>` blocks in
 the logs) are indexed and rendered as plain `/research <args>`, so searching
 for `/research` finds the sessions that ran it.
+
+Sessions named via `/rename` (`{"type":"custom-title",…}` records) show that
+name next to the session id in both `recent` and `search` output; the last
+rename wins. The title is cached in the catalog so search never re-reads the
+jsonl for it.
 
 Snippets come from the chunk byte range stored on each Tantivy doc, then
 re-extracted as JSON values when possible. The default context window is `120`
