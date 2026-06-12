@@ -12,7 +12,9 @@ use crate::fs_scan::{is_appendable_jsonl, DiscoveredFile};
 use crate::term::fmt_size;
 use crate::text::{extract_text, SessionStats};
 
-use super::catalog::{write_catalog, write_manifest, CatalogEntry};
+use super::catalog::{
+    prefix_tail_hash, write_catalog, write_manifest, CatalogEntry, TAIL_HASH_WINDOW,
+};
 use super::schema::{
     fields_from_schema, register_tokenizers, schema_and_fields, subindex_dir, Fields, IndexKind,
 };
@@ -254,6 +256,7 @@ pub fn add_whole_file(
         mtime_ms,
         indexed_offset: indexed_len as u64,
         next_chunk_id: 0,
+        tail_hash: prefix_tail_hash(&data[..indexed_len]),
         prompts: None,
         tools: None,
         display_bytes: None,
@@ -345,6 +348,16 @@ pub fn append_file_tail(
     entry.mtime_ms = file.mtime_ms;
     entry.indexed_offset = indexed_end;
     entry.path = file.path.clone();
+    if indexed_len > 0 {
+        entry.tail_hash = if indexed_len >= TAIL_HASH_WINDOW {
+            prefix_tail_hash(&data[..indexed_len])
+        } else {
+            // The hash window reaches back before the appended range; re-read
+            // the window from the file at its fixed offsets.
+            let from = indexed_end.saturating_sub(TAIL_HASH_WINDOW as u64);
+            prefix_tail_hash(&read_file_range(&file.path, from, indexed_end)?)
+        };
+    }
 
     Ok(AppendResult {
         chunks: content.chunks,

@@ -562,6 +562,50 @@ fn shrink_or_rewrite_reindexes() -> Result<()> {
 }
 
 #[test]
+fn grown_rewrite_with_changed_prefix_reindexes() -> Result<()> {
+    let fx = Fixture::new()?;
+    let path = fx.write_session(
+        "session-grown-rewrite",
+        &format!("{}\n", jsonl_user("DELTAONE original prefix")),
+    );
+    fx.full_reindex()?;
+    assert_session(
+        &fx.search("DELTAONE", SearchMode::Auto),
+        "session-grown-rewrite",
+    );
+
+    // Rewrite in place so the file GROWS but the old prefix is gone — the
+    // size/mtime heuristic alone would treat this as a pure append and keep
+    // stale content indexed forever.
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            jsonl_user("EPSILONTWO replaced prefix"),
+            jsonl_user("ZETATHREE appended line")
+        ),
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let now = std::time::SystemTime::now();
+    filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(now)).ok();
+
+    fx.update()?;
+    assert!(
+        fx.search("DELTAONE", SearchMode::Auto).is_empty(),
+        "stale prefix content must be gone after in-place rewrite"
+    );
+    assert_session(
+        &fx.search("EPSILONTWO", SearchMode::Auto),
+        "session-grown-rewrite",
+    );
+    assert_session(
+        &fx.search("ZETATHREE", SearchMode::Auto),
+        "session-grown-rewrite",
+    );
+    Ok(())
+}
+
+#[test]
 fn path_search_finds_session_by_path() -> Result<()> {
     let fx = Fixture::new()?;
     fx.write_session(

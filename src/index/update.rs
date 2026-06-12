@@ -43,6 +43,10 @@ pub struct UpdatePlan {
     /// without re-stat'ing or re-indexing them so a scoped update does not
     /// accidentally drop unrelated projects.
     pub preserved: Vec<CatalogEntry>,
+    /// Grown files whose indexed prefix no longer matches its recorded
+    /// `tail_hash` — they were rewritten in place, not appended, and must take
+    /// the full-reindex path instead of the append fast path.
+    pub force_reindex: BTreeSet<PathBuf>,
 }
 
 /// Quick boolean check: would a full update make any changes? Used to skip the
@@ -102,13 +106,43 @@ pub fn build_plan_scoped(
         catalog_by_path.insert(entry.path.clone(), entry);
     }
 
+    let mut force_reindex = BTreeSet::new();
+    for (path, entry) in &catalog_by_path {
+        let Some(file) = scanned.get(path) else {
+            continue;
+        };
+        if file.size == entry.size && file.mtime_ms == entry.mtime_ms {
+            continue;
+        }
+        if is_append_candidate(entry, file) && !indexed_prefix_intact(entry) {
+            force_reindex.insert(path.clone());
+        }
+    }
+
     Ok(UpdatePlan {
         source,
         enabled,
         catalog_by_path,
         scanned,
         preserved,
+        force_reindex,
     })
+}
+
+/// Re-hash the tail of the recorded indexed prefix and compare against the
+/// catalog. A mismatch means the file was rewritten in place even though it
+/// grew, so appending the new tail would leave stale content indexed.
+fn indexed_prefix_intact(entry: &CatalogEntry) -> bool {
+    if entry.indexed_offset == 0 {
+        return true;
+    }
+    let from = entry
+        .indexed_offset
+        .saturating_sub(super::catalog::TAIL_HASH_WINDOW as u64);
+    match read_file_range(&entry.path, from, entry.indexed_offset) {
+        Ok(window) => super::catalog::prefix_tail_hash(&window) == entry.tail_hash,
+        Err(_) => false,
+    }
 }
 
 pub fn run_update(
@@ -126,6 +160,7 @@ pub fn run_update(
         mut catalog_by_path,
         scanned,
         preserved,
+        force_reindex,
     } = plan;
     let start = Instant::now();
 
@@ -134,7 +169,7 @@ pub fn run_update(
         .map(|k| k.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    let active = affected_indexes(&enabled, &catalog_by_path, &scanned);
+    let active = affected_indexes(&enabled, &catalog_by_path, &scanned, &force_reindex);
     let main_names = index_names(&active.main);
     let delta_names = index_names(&active.delta);
     let delta_config = WriterConfig::for_delta_update();
@@ -195,7 +230,7 @@ pub fn run_update(
             continue;
         }
 
-        if is_append_update(&entry, file) {
+        if is_append_candidate(&entry, file) && !force_reindex.contains(&path) {
             let start_offset = entry.indexed_offset;
             let start_chunk_id = entry.next_chunk_id;
             let appended = append_file_tail(&mut delta_targets, &mut entry, file)?;
@@ -334,7 +369,9 @@ pub fn run_update(
     Ok(stats)
 }
 
-fn is_append_update(entry: &CatalogEntry, file: &DiscoveredFile) -> bool {
+/// Size/mtime say this could be a pure append; `force_reindex` (built from
+/// the catalog `tail_hash` check) has the final word.
+fn is_append_candidate(entry: &CatalogEntry, file: &DiscoveredFile) -> bool {
     is_appendable_jsonl(&file.path)
         && file.size >= entry.size
         && entry.indexed_offset <= file.size
@@ -351,6 +388,7 @@ fn affected_indexes(
     enabled: &BTreeSet<IndexKind>,
     catalog_by_path: &BTreeMap<PathBuf, CatalogEntry>,
     scanned: &BTreeMap<PathBuf, DiscoveredFile>,
+    force_reindex: &BTreeSet<PathBuf>,
 ) -> AffectedIndexes {
     let mut main_content_changed = false;
     let mut main_path_changed = false;
@@ -367,7 +405,7 @@ fn affected_indexes(
         if file.size == entry.size && file.mtime_ms == entry.mtime_ms {
             continue;
         }
-        if is_append_update(entry, file) {
+        if is_append_candidate(entry, file) && !force_reindex.contains(path) {
             delta_content_changed = true;
             delta_needs_create = true;
             continue;
@@ -539,6 +577,7 @@ pub fn flush_delta(index_dir: &Path, config: WriterConfig, verbose: bool) -> Res
             mtime_ms: 0,
             indexed_offset: entry.indexed_offset,
             next_chunk_id: 0,
+            tail_hash: 0,
             prompts: None,
             tools: None,
             display_bytes: None,
@@ -579,6 +618,7 @@ mod tests {
             mtime_ms,
             indexed_offset: size,
             next_chunk_id: 1,
+            tail_hash: 0,
             prompts: None,
             tools: None,
             display_bytes: None,
@@ -605,7 +645,7 @@ mod tests {
         let mut scanned = BTreeMap::new();
         scanned.insert(path, discovered_file("/tmp/session.jsonl", 20, 2));
 
-        let affected = affected_indexes(&enabled, &catalog, &scanned);
+        let affected = affected_indexes(&enabled, &catalog, &scanned, &BTreeSet::new());
         assert!(affected.main.is_empty());
         assert!(affected.delta.contains(&IndexKind::Word));
         assert!(affected.delta.contains(&IndexKind::Trigram));
@@ -622,7 +662,7 @@ mod tests {
         let mut scanned = BTreeMap::new();
         scanned.insert(path, discovered_file("/tmp/session.jsonl", 10, 2));
 
-        let affected = affected_indexes(&enabled, &catalog, &scanned);
+        let affected = affected_indexes(&enabled, &catalog, &scanned, &BTreeSet::new());
         assert_eq!(affected.main, enabled);
         assert!(affected.delta.contains(&IndexKind::Word));
         assert!(affected.delta.contains(&IndexKind::Trigram));

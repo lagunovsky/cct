@@ -11,7 +11,24 @@ use super::schema::IndexKind;
 use super::writer::WriterConfig;
 
 const CATALOG_HEADER: &str =
-    "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\tprompts\ttools\tdisplay_bytes\ttitle\tpath";
+    "file_id\tkind\tsize\tmtime_ms\tindexed_offset\tnext_chunk_id\ttail_hash\tprompts\ttools\tdisplay_bytes\ttitle\tpath";
+
+/// How many trailing bytes of the indexed prefix participate in `tail_hash`.
+pub const TAIL_HASH_WINDOW: usize = 4096;
+
+/// FNV-1a hash of the last `TAIL_HASH_WINDOW` bytes of an indexed prefix.
+/// Lets an incremental update verify that a grown file is a true append —
+/// an in-place rewrite that kept the size growing would otherwise leave
+/// stale content indexed forever.
+pub fn prefix_tail_hash(prefix: &[u8]) -> u64 {
+    let from = prefix.len().saturating_sub(TAIL_HASH_WINDOW);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in &prefix[from..] {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 const DELTA_CATALOG_HEADER: &str =
     "file_id\tstart_offset\tend_offset\tstart_chunk_id\tend_chunk_id\tpath";
 
@@ -23,6 +40,8 @@ pub struct CatalogEntry {
     pub mtime_ms: u128,
     pub indexed_offset: u64,
     pub next_chunk_id: u64,
+    /// `prefix_tail_hash` of the indexed prefix; guards the append fast path.
+    pub tail_hash: u64,
     pub prompts: Option<u32>,
     pub tools: Option<u32>,
     pub display_bytes: Option<u64>,
@@ -84,8 +103,8 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
         if line.trim().is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(11, '\t').collect();
-        if parts.len() != 11 {
+        let parts: Vec<&str> = line.splitn(12, '\t').collect();
+        if parts.len() != 12 {
             bail!("bad catalog line {} in {}", line_no + 2, path.display());
         }
         entries.push(CatalogEntry {
@@ -105,15 +124,18 @@ pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {
             next_chunk_id: parts[5]
                 .parse()
                 .with_context(|| format!("bad next_chunk_id at catalog line {}", line_no + 2))?,
-            prompts: parse_optional_u32(parts[6], "prompts", line_no + 2)?,
-            tools: parse_optional_u32(parts[7], "tools", line_no + 2)?,
-            display_bytes: parse_optional_u64(parts[8], "display_bytes", line_no + 2)?,
-            title: if parts[9].is_empty() {
+            tail_hash: parts[6]
+                .parse()
+                .with_context(|| format!("bad tail_hash at catalog line {}", line_no + 2))?,
+            prompts: parse_optional_u32(parts[7], "prompts", line_no + 2)?,
+            tools: parse_optional_u32(parts[8], "tools", line_no + 2)?,
+            display_bytes: parse_optional_u64(parts[9], "display_bytes", line_no + 2)?,
+            title: if parts[10].is_empty() {
                 None
             } else {
-                Some(parts[9].to_string())
+                Some(parts[10].to_string())
             },
-            path: PathBuf::from(parts[10]),
+            path: PathBuf::from(parts[11]),
         });
     }
     Ok(entries)
@@ -160,13 +182,14 @@ pub fn write_catalog(index_dir: &Path, entries: &[CatalogEntry]) -> Result<PathB
             .unwrap_or_default();
         writeln!(
             f,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             e.file_id,
             e.kind,
             e.size,
             e.mtime_ms,
             e.indexed_offset,
             e.next_chunk_id,
+            e.tail_hash,
             prompts,
             tools,
             display_bytes,
