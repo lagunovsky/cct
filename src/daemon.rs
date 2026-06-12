@@ -39,6 +39,12 @@ pub fn install_daemon() -> Result<()> {
     <integer>{interval}</integer>
     <key>RunAtLoad</key>
     <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityBackgroundIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>{logs}/cct.log</string>
     <key>StandardErrorPath</key>
@@ -97,7 +103,10 @@ pub fn run_background_update() -> Result<()> {
     if !on_ac_power() {
         return Ok(());
     }
-    commands::run_silent_update(&index_root()?)?;
+    commands::run_silent_update(
+        &index_root()?,
+        crate::index::writer::WriterConfig::for_background_daemon(),
+    )?;
     // Opt-in background archiving (`cct archive --auto <age>`). Runs after
     // the update+flush above, so archived tails are already in the main index.
     if let Some(days) = crate::config::auto_archive_days() {

@@ -286,7 +286,7 @@ pub fn run_transfer(args: cli::TransferCmd) -> Result<()> {
 }
 
 /// Used by daemon update — silent except for errors.
-pub fn run_silent_update(index_dir: &Path) -> Result<()> {
+pub fn run_silent_update(index_dir: &Path, config: WriterConfig) -> Result<()> {
     let source = projects_dir()?;
     if !index_dir.exists() {
         return Ok(());
@@ -295,15 +295,10 @@ pub fn run_silent_update(index_dir: &Path) -> Result<()> {
     let files = collect_cct_layout(&source)?;
     let plan = build_plan(index_dir, Some(source.clone()), files)?;
     if !needs_update(&plan) {
-        return flush_delta(index_dir, WriterConfig::for_incremental_update(), false);
+        return flush_delta(index_dir, config, false);
     }
-    run_update(
-        index_dir,
-        plan,
-        WriterConfig::for_incremental_update(),
-        false,
-    )?;
-    flush_delta(index_dir, WriterConfig::for_incremental_update(), false)?;
+    run_update(index_dir, plan, config, false)?;
+    flush_delta(index_dir, config, false)?;
     Ok(())
 }
 

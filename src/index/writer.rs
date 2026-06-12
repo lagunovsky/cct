@@ -79,6 +79,21 @@ impl WriterConfig {
             merge_policy: MergePolicyMode::None,
         }
     }
+
+    /// Daemon preset: cap indexing at a quarter of the cores (min 1) and a
+    /// single merge thread so background maintenance never saturates the
+    /// machine the user is working on.
+    pub fn for_background_daemon() -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        Self {
+            memory_mb: DEFAULT_MAINTENANCE_MEMORY_MB,
+            worker_threads: Some((cores / 4).max(1)),
+            merge_threads: 1,
+            merge_policy: MergePolicyMode::None,
+        }
+    }
 }
 
 pub fn default_full_reindex_memory_mb() -> usize {
