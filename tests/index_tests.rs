@@ -575,6 +575,74 @@ fn path_search_finds_session_by_path() -> Result<()> {
 }
 
 #[test]
+fn path_only_hits_have_visible_snippets() -> Result<()> {
+    use cct::index::search::select_visible_snippets;
+    let fx = Fixture::new()?;
+    fx.write_session(
+        "session-with-uniqueid",
+        &format!("{}\n", jsonl_user("ordinary content")),
+    );
+    fx.full_reindex()?;
+    let results = fx.search("session-with-uniqueid", SearchMode::Only(IndexKind::Path));
+    assert_session(&results, "session-with-uniqueid");
+    let session = results
+        .iter()
+        .find(|r| r.session_id == "session-with-uniqueid")
+        .unwrap();
+    assert!(
+        !select_visible_snippets(&session.snippets, false).is_empty(),
+        "path-only hit must produce a visible snippet, got {:?}",
+        session.snippets
+    );
+    Ok(())
+}
+
+#[test]
+fn short_pathish_query_still_searches_word_index() -> Result<()> {
+    let fx = Fixture::new()?;
+    fx.write_session(
+        "session-short",
+        &format!("{}\n", jsonl_user("see c docs for details")),
+    );
+    fx.full_reindex()?;
+    // "c/" enables the Path subindex in auto mode but is too short for the
+    // ngram tokenizer; the word index must still be searched.
+    let opts = SearchOptions {
+        query: "c/".to_string(),
+        mode: SearchMode::Auto,
+        limit: 20,
+        context_chars: 80,
+        project_prefix: None,
+        fuzzy: false,
+    };
+    let results = run_search(&fx.index_dir, &opts)?;
+    assert_session(&results, "session-short");
+    Ok(())
+}
+
+#[test]
+fn phrase_with_quotes_matches_escaped_jsonl() -> Result<()> {
+    use cct::index::search::select_visible_snippets;
+    let fx = Fixture::new()?;
+    fx.write_session(
+        "session-quotes",
+        &format!("{}\n", jsonl_user(r#"please say "hello" twice"#)),
+    );
+    fx.full_reindex()?;
+    let results = fx.search(r#"say "hello" twice"#, SearchMode::Auto);
+    assert_session(&results, "session-quotes");
+    let session = results
+        .iter()
+        .find(|r| r.session_id == "session-quotes")
+        .unwrap();
+    assert!(
+        !select_visible_snippets(&session.snippets, false).is_empty(),
+        "quoted phrase must produce a snippet from the escaped raw line"
+    );
+    Ok(())
+}
+
+#[test]
 fn snippets_come_from_chunk_offsets() -> Result<()> {
     let fx = Fixture::new()?;
     fx.write_session(

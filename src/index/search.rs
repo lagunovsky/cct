@@ -131,7 +131,18 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     if opts.query.trim().is_empty() {
         bail!("empty query");
     }
-    let kinds = select_indexes(opts.mode, &opts.query);
+    let mut kinds = select_indexes(opts.mode, &opts.query);
+    // The ngram(3,3) tokenizer yields no tokens for queries shorter than three
+    // chars; drop such subindexes instead of letting build_query fail the
+    // whole search (e.g. `c/` enables Path in auto mode).
+    kinds.retain(|kind| {
+        query_tokens(*kind, &opts.query)
+            .map(|tokens| !tokens.is_empty())
+            .unwrap_or(true)
+    });
+    if kinds.is_empty() {
+        bail!("query contains no searchable tokens");
+    }
 
     let mut hits: Vec<DocHit> = Vec::new();
     let limit = candidate_limit(opts.limit);
@@ -409,7 +420,22 @@ fn snippets_for_hits(
         }
         n
     };
-    let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
+    // The line gate scans the RAW jsonl line, where the needle may appear
+    // JSON-escaped (`say "hi"` is stored as `say \"hi\"`), so each needle
+    // also matches via its escaped form. Snippet extraction below still uses
+    // the original needle against decoded JSON values.
+    let needle_variants: Vec<Vec<String>> = needles
+        .iter()
+        .map(|n| {
+            let lower = n.to_lowercase();
+            let escaped = json_escape(&lower);
+            let mut variants = vec![lower];
+            if escaped != variants[0] {
+                variants.push(escaped);
+            }
+            variants
+        })
+        .collect();
     let mut budget = 6usize;
 
     for hit in hits {
@@ -417,6 +443,17 @@ fn snippets_for_hits(
             break;
         }
         let Some((start, end)) = hit.snippet_range else {
+            // Path-index hits carry no byte range; surface the matched file
+            // path itself so the session isn't dropped as snippet-less.
+            let text = path.display().to_string();
+            if !out.iter().any(|existing: &Snippet| existing.text == text) {
+                out.push(Snippet {
+                    tag: "path".to_string(),
+                    text,
+                    time_ms: 0,
+                });
+                budget = budget.saturating_sub(1);
+            }
             continue;
         };
         let Ok(bytes) = read_file_range(path, start, end) else {
@@ -428,7 +465,11 @@ fn snippets_for_hits(
         let lines = split_keep_offsets(text);
         for (line_start, line) in lines {
             let lower = line.to_lowercase();
-            if !needles_lower.iter().any(|n| lower.contains(n)) {
+            if !needle_variants
+                .iter()
+                .flatten()
+                .any(|n| lower.contains(n.as_str()))
+            {
                 continue;
             }
             let abs = start as usize + line_start;
@@ -437,8 +478,8 @@ fn snippets_for_hits(
             }
             let tag = classify_line(line);
             let ts = extract_top_level_timestamp_ms(line);
-            for (needle, needle_lower) in needles.iter().zip(needles_lower.iter()) {
-                if !lower.contains(needle_lower) {
+            for (needle, variants) in needles.iter().zip(needle_variants.iter()) {
+                if !variants.iter().any(|v| lower.contains(v.as_str())) {
                     continue;
                 }
                 for snippet_text in extract_all_snippets(line, needle, context_chars, budget) {
@@ -468,6 +509,16 @@ fn snippets_for_hits(
         }
     }
     out
+}
+
+/// How `text` looks inside a JSON string literal, without the surrounding quotes.
+fn json_escape(text: &str) -> String {
+    let quoted = serde_json::to_string(text).unwrap_or_default();
+    quoted
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(text)
+        .to_string()
 }
 
 fn split_keep_offsets(text: &str) -> Vec<(usize, &str)> {
@@ -729,10 +780,7 @@ fn build_query(
     query: &str,
     project_id: Option<&str>,
 ) -> Result<Box<dyn Query>> {
-    let tokens = match kind {
-        IndexKind::Word => token_text(WORD_TOKENIZER, query)?,
-        IndexKind::Trigram | IndexKind::Path => token_text(NGRAM_TOKENIZER, query)?,
-    };
+    let tokens = query_tokens(kind, query)?;
     if tokens.is_empty() {
         bail!(
             "{} mode could not extract any searchable tokens from query",
@@ -753,6 +801,13 @@ fn build_query(
         clauses.push((Occur::Must, q));
     }
     Ok(Box::new(BooleanQuery::new(clauses)))
+}
+
+fn query_tokens(kind: IndexKind, query: &str) -> Result<Vec<String>> {
+    match kind {
+        IndexKind::Word => token_text(WORD_TOKENIZER, query),
+        IndexKind::Trigram | IndexKind::Path => token_text(NGRAM_TOKENIZER, query),
+    }
 }
 
 fn token_text(name: &str, text: &str) -> Result<Vec<String>> {
