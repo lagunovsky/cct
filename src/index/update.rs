@@ -233,7 +233,20 @@ pub fn run_update(
         if is_append_candidate(&entry, file) && !force_reindex.contains(&path) {
             let start_offset = entry.indexed_offset;
             let start_chunk_id = entry.next_chunk_id;
-            let appended = append_file_tail(&mut delta_targets, &mut entry, file)?;
+            let appended = match append_file_tail(&mut delta_targets, &mut entry, file) {
+                Ok(appended) => appended,
+                // Vanished between scan and read (session cleanup): treat as
+                // deleted instead of aborting the whole update.
+                Err(err) if is_not_found(&err) => {
+                    delete_file_docs(&mut main_targets, entry.file_id);
+                    delete_file_docs(&mut delta_targets, entry.file_id);
+                    delta_catalog_dirty |=
+                        remove_delta_entries_for_file(&mut delta_catalog, entry.file_id);
+                    stats.deleted += 1;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             stats.appended += 1;
             stats.indexed_chunks += appended.chunks;
             stats.read_bytes += appended.read_bytes;
@@ -256,7 +269,15 @@ pub fn run_update(
         delete_file_docs(&mut main_targets, entry.file_id);
         delete_file_docs(&mut delta_targets, entry.file_id);
         delta_catalog_dirty |= remove_delta_entries_for_file(&mut delta_catalog, entry.file_id);
-        let (new_entry, chunks) = add_whole_file(&mut main_targets, file, entry.file_id)?;
+        let (new_entry, chunks) = match add_whole_file(&mut main_targets, file, entry.file_id) {
+            Ok(added) => added,
+            // Docs are already deleted above, so a vanished file is just a delete.
+            Err(err) if is_not_found(&err) => {
+                stats.deleted += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         stats.reindexed += 1;
         stats.indexed_chunks += chunks;
         stats.read_bytes += new_entry.size;
@@ -276,7 +297,11 @@ pub fn run_update(
         // the same deterministic file_id; deleting first keeps it idempotent
         // (a no-op delete on the first run).
         delete_file_docs(&mut main_targets, next_file_id);
-        let (entry, chunks) = add_whole_file(&mut main_targets, file, next_file_id)?;
+        let (entry, chunks) = match add_whole_file(&mut main_targets, file, next_file_id) {
+            Ok(added) => added,
+            Err(err) if is_not_found(&err) => continue,
+            Err(err) => return Err(err),
+        };
         next_file_id = next_file_id.saturating_add(1);
         stats.added += 1;
         stats.indexed_chunks += chunks;
@@ -367,6 +392,12 @@ pub fn run_update(
         }
     }
     Ok(stats)
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Size/mtime say this could be a pure append; `force_reindex` (built from

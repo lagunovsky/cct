@@ -292,8 +292,11 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         .retain(|s| !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty());
     let total = sessions.len();
     let to_show = sessions.len().min(args.limit);
-    if to_show == 0 {
+    if total == 0 {
         println!("\n{DIM}No matches found{RESET}");
+    } else if to_show == 0 {
+        // -n 0: matches exist but none are displayed.
+        println!("\n{DIM}{total} match(es). Use -n to show them.{RESET}");
     } else {
         // Precompute stats in parallel — each session's stats require reading
         // and parsing its full JSONL, which is the dominant render cost when
@@ -435,11 +438,13 @@ fn resolve_project_prefix(args: &cli::SearchCmd) -> Result<Option<ResolvedProjec
     };
     let label = short_project(&abs.to_string_lossy());
     let prefix = projects_dir()?.join(encode_project_dir(&abs.to_string_lossy()));
-    if !prefix.exists() && args.project.is_none() {
+    if !prefix.exists() {
+        // For an explicit -p this makes a typo'd path distinguishable from
+        // "no matches found".
         eprintln!(
             "No Claude Code sessions in {label}. Use 'cct search -g <query>' to search across all projects."
         );
-        return Err(anyhow!("no sessions in cwd"));
+        return Err(anyhow!("no sessions in {label}"));
     }
     Ok(Some(ResolvedProject { prefix, label }))
 }

@@ -357,7 +357,8 @@ pub fn write_manifest(
 ) -> Result<()> {
     fs::create_dir_all(index_dir).ok();
     let path = manifest_path(index_dir);
-    let mut f = BufWriter::new(File::create(&path)?);
+    let tmp_path = index_dir.join("manifest.txt.tmp");
+    let mut f = BufWriter::new(File::create(&tmp_path)?);
     writeln!(f, "source={}", source.display())?;
     writeln!(f, "indexed_files={indexed_files}")?;
     writeln!(f, "source_bytes={source_bytes}")?;
@@ -381,5 +382,11 @@ pub fn write_manifest(
             .collect::<Vec<_>>()
             .join(",")
     )?;
+    // Flush explicitly: a BufWriter drop swallows write errors, and a torn
+    // manifest loses the `indexes=` line, breaking `--only` setups.
+    f.flush()?;
+    drop(f);
+    fs::rename(&tmp_path, &path)
+        .with_context(|| format!("replace manifest {}", path.display()))?;
     Ok(())
 }

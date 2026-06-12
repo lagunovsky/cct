@@ -46,18 +46,21 @@ pub fn rename_project_in(args: RenameArgs, projects: &Path) -> Result<()> {
     if !info.is_dir() {
         bail!("not a directory: {}", old_sess_dir.display());
     }
-    if new_sess_dir.exists() {
+    // On case-insensitive filesystems (default APFS) a case-only rename makes
+    // `exists()` see the source itself — that's a legitimate rename, not a
+    // conflict with another project.
+    if new_sess_dir.exists() && !same_dir_entry(&old_sess_dir, &new_sess_dir) {
         bail!(
             "target sessions dir already exists: {}",
             new_sess_dir.display()
         );
     }
-    if args.move_dir && new_abs.exists() {
+    if args.move_dir && new_abs.exists() && !same_dir_entry(&old_abs, &new_abs) {
         bail!("target project dir already exists: {}", new_abs.display());
     }
 
-    let (jsonl_files, total_matches) =
-        scan_jsonl_for_path(&old_sess_dir, old_abs.to_string_lossy().as_bytes())?;
+    let (referencing_files, total_matches) =
+        scan_files_for_path(&old_sess_dir, old_abs.to_string_lossy().as_bytes())?;
 
     println!("{BOLD}Rename project sessions:{RESET}");
     println!("  from: {}", old_abs.display());
@@ -68,8 +71,8 @@ pub fn rename_project_in(args: RenameArgs, projects: &Path) -> Result<()> {
         short_project(&new_sess_dir.to_string_lossy())
     );
     println!(
-        "  jsonl files referencing old cwd: {} ({} total replacements)",
-        jsonl_files.len(),
+        "  files referencing old cwd: {} ({} total replacements)",
+        referencing_files.len(),
         total_matches
     );
     if args.move_dir {
@@ -98,7 +101,7 @@ pub fn rename_project_in(args: RenameArgs, projects: &Path) -> Result<()> {
     let mut failed: Vec<String> = Vec::new();
     let old_bytes = old_abs.to_string_lossy().as_bytes().to_vec();
     let new_bytes = new_abs.to_string_lossy().as_bytes().to_vec();
-    for old_file in &jsonl_files {
+    for old_file in &referencing_files {
         let rel = match old_file.strip_prefix(&old_sess_dir) {
             Ok(r) => r.to_path_buf(),
             Err(err) => {
@@ -123,13 +126,21 @@ pub fn rename_project_in(args: RenameArgs, projects: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn scan_jsonl_for_path(dir: &Path, needle: &[u8]) -> Result<(Vec<PathBuf>, usize)> {
+/// True when both paths refer to the same directory entry (case-only rename
+/// on a case-insensitive filesystem).
+fn same_dir_entry(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Scan every file under `dir` (jsonl logs AND tool-results etc., matching
+/// what `cct transfer` rewrites) for path references.
+pub fn scan_files_for_path(dir: &Path, needle: &[u8]) -> Result<(Vec<PathBuf>, usize)> {
     let mut files = Vec::new();
     let mut total = 0;
     walk_dir(dir, &mut |p| {
-        if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            return;
-        }
         if let Ok(data) = fs::read(p) {
             let count = count_overlapping(&data, needle);
             if count > 0 {

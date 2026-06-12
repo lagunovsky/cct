@@ -169,7 +169,13 @@ fn read_optional_dir(path: &Path) -> Result<Option<fs::ReadDir>> {
 }
 
 fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) -> Result<()> {
-    let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    // The file can vanish between read_dir and stat (Claude Code cleaning up
+    // old sessions); skip it instead of failing the whole scan.
+    let meta = match fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+    };
     let mtime_ms = meta
         .modified()
         .ok()

@@ -299,7 +299,7 @@ pub fn trunc_to_width(s: &str, n: usize) -> String {
         }
         out.push(ch);
         width += ch_width;
-        if width + 1 <= n {
+        if width < n {
             cut = (out.len(), styled);
         }
     }
