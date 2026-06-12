@@ -9,7 +9,7 @@ use crate::path_codec::{
     absolutize_lexical, clean_path_lexical, encode_project_dir, projects_dir, short_project,
 };
 use crate::picker::{confirm, run_multi_picker, PickerItem};
-use crate::recent::{first_user_prompt, session_activity_time_ms};
+use crate::recent::{first_user_prompt, session_activity_time_ms, session_title};
 use crate::rename::{count_overlapping, replace_in_file};
 use crate::term::{fmt_size, BOLD, CYAN, DIM, GREEN, RED, RESET};
 
@@ -65,6 +65,7 @@ pub struct SessionEntry {
     pub path: PathBuf,
     pub mtime_ms: i64,
     pub size: u64,
+    pub title: Option<String>,
 }
 
 pub fn list_project_sessions(proj_abs: &Path) -> Result<Vec<SessionEntry>> {
@@ -86,11 +87,13 @@ pub fn list_project_sessions(proj_abs: &Path) -> Result<Vec<SessionEntry>> {
             .unwrap_or_default();
         let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         let mtime_ms = session_activity_time_ms(&p);
+        let title = session_title(&p);
         out.push(SessionEntry {
             id,
             path: p,
             mtime_ms,
             size,
+            title,
         });
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.mtime_ms));
@@ -114,7 +117,12 @@ fn pick_sessions_interactive(sessions: &[SessionEntry], src_abs: &Path) -> Resul
             .unwrap_or_else(|| "?".into());
         let id_short = s.id.chars().take(8).collect::<String>();
         let stats = format!("  {}", fmt_size(s.size));
-        let line1 = format!("{CYAN}{id_short}{RESET}  {DIM}{when}{RESET}  {DIM}{stats}{RESET}");
+        let name = match &s.title {
+            Some(t) if !t.is_empty() => format!("  {GREEN}{BOLD}{t}{RESET}"),
+            _ => String::new(),
+        };
+        let line1 =
+            format!("{CYAN}{id_short}{RESET}{name}  {DIM}{when}{RESET}  {DIM}{stats}{RESET}");
         let line2 = if first.is_empty() {
             String::new()
         } else {
@@ -124,7 +132,14 @@ fn pick_sessions_interactive(sessions: &[SessionEntry], src_abs: &Path) -> Resul
             }
             s
         };
-        let haystack = format!("{} {} {}", s.id, when, first).to_lowercase();
+        let haystack = format!(
+            "{} {} {} {}",
+            s.id,
+            s.title.as_deref().unwrap_or(""),
+            when,
+            first
+        )
+        .to_lowercase();
         items.push(PickerItem {
             id: s.id.clone(),
             line1,
@@ -141,7 +156,8 @@ fn resolve_session_id(src_dir: &Path, q: &str) -> Result<String> {
     if exact.exists() {
         return Ok(q.to_string());
     }
-    let prefix = q.to_string();
+
+    // 1) Match by session id prefix — cheap, only inspects file names.
     let mut matches: Vec<String> = Vec::new();
     for entry in fs::read_dir(src_dir)? {
         let entry = entry?;
@@ -153,18 +169,43 @@ fn resolve_session_id(src_dir: &Path, q: &str) -> Result<String> {
         let Some(stem) = name.strip_suffix(".jsonl") else {
             continue;
         };
-        if stem.starts_with(&prefix) {
+        if stem.starts_with(q) {
             matches.push(stem.to_string());
         }
     }
-    match matches.len() {
+    if matches.len() == 1 {
+        return Ok(matches.remove(0));
+    }
+    if matches.len() > 1 {
+        bail!("id prefix {:?} is ambiguous ({} matches)", q, matches.len());
+    }
+
+    // 2) Fall back to an exact session-title (`/rename`) match — reads files,
+    //    so only done when no id matched.
+    let mut by_title: Vec<String> = Vec::new();
+    for entry in fs::read_dir(src_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if session_title(&p).as_deref() == Some(q) {
+            if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) {
+                by_title.push(stem);
+            }
+        }
+    }
+    match by_title.len() {
         0 => Err(anyhow!(
             "no session matches {:?} in {}",
             q,
             src_dir.display()
         )),
-        1 => Ok(matches.remove(0)),
-        n => Err(anyhow!("prefix {:?} is ambiguous ({n} matches)", q)),
+        1 => Ok(by_title.remove(0)),
+        n => Err(anyhow!("title {:?} is ambiguous ({n} matches)", q)),
     }
 }
 

@@ -89,22 +89,16 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
     Ok(())
 }
 
-/// Activity time for sorting: last top-level timestamp in the file (read via tail), else mtime.
-pub fn session_activity_time_ms(path: &Path) -> i64 {
+/// Read whole jsonl lines from roughly the last `TAIL` bytes of a session log,
+/// starting at a line boundary. Falls back to the whole file when it is small
+/// or the tail has no newline. Returns an empty vec on I/O error.
+fn read_session_tail(path: &Path) -> Vec<u8> {
     const TAIL: u64 = 256 * 1024;
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return 0,
+    let Ok(meta) = fs::metadata(path) else {
+        return Vec::new();
     };
-    let mtime_fallback = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-
     let Ok(mut f) = fs::File::open(path) else {
-        return mtime_fallback;
+        return Vec::new();
     };
     let total = meta.len();
     let mut data = Vec::new();
@@ -123,12 +117,31 @@ pub fn session_activity_time_ms(path: &Path) -> i64 {
             data = buf;
         }
     }
+    data
+}
+
+/// Activity time for sorting: last top-level timestamp in the file (read via tail), else mtime.
+pub fn session_activity_time_ms(path: &Path) -> i64 {
+    let mtime_fallback = fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let data = read_session_tail(path);
     let ts = last_message_time_ms(&data);
     if ts != 0 {
         ts
     } else {
         mtime_fallback
     }
+}
+
+/// The user-assigned session name (`/rename`), read from the file tail since the
+/// `custom-title` record lands near the end of the log.
+pub fn session_title(path: &Path) -> Option<String> {
+    crate::text::extract_session_title(&read_session_tail(path))
 }
 
 /// Returns `(tail_pairs, total_prompts, tool_calls, bytes, title)`.

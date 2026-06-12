@@ -250,6 +250,33 @@ fn transfer_relocates_jsonl_and_rewrites_cwd() -> Result<()> {
 }
 
 #[test]
+fn transfer_resolves_session_by_title() -> Result<()> {
+    let fx = WorkspaceFixture::new()?;
+    let src = fx.make_project("srctitle", &[("dddd4444", "named session")])?;
+    let dst = fx.work.join("dsttitle");
+    fs::create_dir_all(&dst)?;
+
+    // Append a `/rename` custom-title record to the session log.
+    let src_sess = fx.session_dir_for(&src);
+    let file = src_sess.join("dddd4444.jsonl");
+    let mut content = read_to_string(&file);
+    content.push_str(r#"{"type":"custom-title","customTitle":"my-cool-name","sessionId":"dddd4444"}"#);
+    content.push('\n');
+    fs::write(&file, content)?;
+
+    // Transfer by the human name rather than the id.
+    transfer_sessions_in(&["my-cool-name".to_string()], &src, &dst, false, &fx.projects)?;
+
+    let dst_sess = fx.session_dir_for(&dst);
+    assert!(
+        dst_sess.join("dddd4444.jsonl").exists(),
+        "session should move when resolved by title"
+    );
+    assert!(!src_sess.join("dddd4444.jsonl").exists());
+    Ok(())
+}
+
+#[test]
 fn transfer_carries_subdirs_and_rewrites_their_files() -> Result<()> {
     let fx = WorkspaceFixture::new()?;
     let src = fx.make_project("src2", &[("ccc33333", "with subdir")])?;
