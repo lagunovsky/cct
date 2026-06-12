@@ -30,17 +30,33 @@ pub fn run_multi_picker(items: &[PickerItem], title: &str) -> Result<Vec<String>
     if !crate::term::stdin_is_tty() || !crate::term::stdout_is_tty() {
         return fallback_text_picker(items, title);
     }
-    enable_raw_mode()?;
+    let _guard = TermGuard::enter()?;
     let mut out = stdout();
-    out.execute(EnterAlternateScreen)?;
-    out.execute(Hide)?;
+    run_loop(items, title, &mut out)
+}
 
-    let result = run_loop(items, title, &mut out);
+/// Restores the terminal in Drop so an early `?` or a panic inside the picker
+/// can't leave the shell stuck in raw mode / the alternate screen.
+struct TermGuard;
 
-    out.execute(Show).ok();
-    out.execute(LeaveAlternateScreen).ok();
-    disable_raw_mode().ok();
-    result
+impl TermGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let guard = TermGuard;
+        let mut out = stdout();
+        out.execute(EnterAlternateScreen)?;
+        out.execute(Hide)?;
+        Ok(guard)
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        let mut out = stdout();
+        out.execute(Show).ok();
+        out.execute(LeaveAlternateScreen).ok();
+        disable_raw_mode().ok();
+    }
 }
 
 fn run_loop(items: &[PickerItem], title: &str, out: &mut std::io::Stdout) -> Result<Vec<String>> {
@@ -74,6 +90,11 @@ fn run_loop(items: &[PickerItem], title: &str, out: &mut std::io::Stdout) -> Res
                 }
                 if filter_mode {
                     match key.code {
+                        // Raw mode suppresses SIGINT, so Ctrl+C must be
+                        // handled here too, not only in normal mode.
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Err(anyhow!("aborted"));
+                        }
                         KeyCode::Esc | KeyCode::Enter => filter_mode = false,
                         KeyCode::Backspace => {
                             filter.pop();
