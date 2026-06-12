@@ -237,6 +237,10 @@ pub fn run_update(
         let Some(file) = scanned.get(&path) else {
             continue;
         };
+        // A crash between commit and write_catalog re-runs this branch with
+        // the same deterministic file_id; deleting first keeps it idempotent
+        // (a no-op delete on the first run).
+        delete_file_docs(&mut main_targets, next_file_id);
         let (entry, chunks) = add_whole_file(&mut main_targets, file, next_file_id)?;
         next_file_id = next_file_id.saturating_add(1);
         stats.added += 1;
@@ -498,30 +502,54 @@ pub fn flush_delta(index_dir: &Path, config: WriterConfig, verbose: bool) -> Res
         print_writer_config(config, content_indexes.len());
     }
 
+    let catalog_by_id: BTreeMap<u64, CatalogEntry> = read_catalog(index_dir)?
+        .into_iter()
+        .map(|e| (e.file_id, e))
+        .collect();
+
     let mut targets = open_existing_targets(index_dir, &content_indexes, config)?;
     let start = Instant::now();
+    // Per file: delete its main content docs and re-add the whole indexed
+    // prefix. Replaying delta ranges on top of main would duplicate documents
+    // whenever a crash lands between commit and delta-dir removal; the
+    // delete-before-add makes a replay idempotent.
+    let mut flushed_files = BTreeSet::new();
     for delta in &delta_catalog {
-        let data = read_file_range(&delta.path, delta.start_offset, delta.end_offset)?;
-        let path_string = delta.path.to_string_lossy().into_owned();
-        let project_id = project_id_for_path(&delta.path);
-        let mut entry = CatalogEntry {
-            file_id: delta.file_id,
+        if !flushed_files.insert(delta.file_id) {
+            continue;
+        }
+        let Some(entry) = catalog_by_id.get(&delta.file_id) else {
+            continue;
+        };
+        // Read before deleting: if the file vanished, keep its existing main
+        // docs — the next update will notice the deletion and clean them up.
+        let Ok(data) = read_file_range(&entry.path, 0, entry.indexed_offset) else {
+            if verbose {
+                eprintln!("  skipped vanished {}", entry.path.display());
+            }
+            continue;
+        };
+        let path_string = entry.path.to_string_lossy().into_owned();
+        let project_id = project_id_for_path(&entry.path);
+        delete_file_docs(&mut targets, delta.file_id);
+        let mut fresh = CatalogEntry {
+            file_id: entry.file_id,
             kind: String::new(),
-            size: delta.end_offset,
+            size: entry.indexed_offset,
             mtime_ms: 0,
-            indexed_offset: delta.end_offset,
-            next_chunk_id: delta.start_chunk_id,
+            indexed_offset: entry.indexed_offset,
+            next_chunk_id: 0,
             prompts: None,
             tools: None,
             display_bytes: None,
             title: None,
-            path: delta.path.clone(),
+            path: entry.path.clone(),
         };
         let _content = add_content_bytes(
             &mut targets,
-            &mut entry,
+            &mut fresh,
             &data,
-            delta.start_offset,
+            0,
             &path_string,
             &project_id,
         )?;
