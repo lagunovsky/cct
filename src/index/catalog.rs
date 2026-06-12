@@ -81,6 +81,25 @@ pub fn catalog_path(index_dir: &Path) -> PathBuf {
     index_dir.join("catalog.tsv")
 }
 
+/// Exclusive inter-process lock serializing index mutations (interactive
+/// updates, the daemon's update/flush, reindex, compact). The lock file lives
+/// NEXT TO `index_dir`, not inside it — a full reindex wipes the directory,
+/// which would silently detach any lock held on a file within. Blocks until
+/// the lock is free; released when the returned handle drops.
+pub fn lock_index_exclusive(index_dir: &Path) -> Result<File> {
+    let name = index_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("index");
+    let parent = index_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).ok();
+    let path = parent.join(format!("{name}.lock"));
+    let file = File::create(&path).with_context(|| format!("create lock {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("lock {}", path.display()))?;
+    Ok(file)
+}
+
 /// Read the catalog. Returns an empty vec if the file is missing,
 /// but bails on a schema mismatch so callers know to rebuild.
 pub fn read_catalog(index_dir: &Path) -> Result<Vec<CatalogEntry>> {

@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail, Result};
 use crate::cli;
 use crate::fs_scan::{collect_cct_layout, collect_one_project};
 use crate::index::build::run_full_reindex;
+use crate::index::catalog::lock_index_exclusive;
 use crate::index::compact::{optimize_delta, run_compact};
 use crate::index::search::{self, SearchOptions};
 use crate::index::update::{build_plan, build_plan_scoped, flush_delta, needs_update, run_update};
@@ -105,6 +106,7 @@ pub fn run_reindex(args: cli::ReindexCmd) -> Result<()> {
     let index_dir = index_root()?;
     let files = collect_cct_layout(&source)?;
     let start = Instant::now();
+    let _lock = lock_index_exclusive(&index_dir)?;
     run_full_reindex(&source, &index_dir, &enabled, files, config, true)?;
     eprintln!("Done in {:?}", start.elapsed());
     Ok(())
@@ -120,6 +122,9 @@ pub fn run_update_cmd(args: cli::UpdateCmd) -> Result<()> {
             index_dir.display()
         );
     }
+    // The lock must cover plan building too: a plan built against a catalog
+    // another process is rewriting would roll its entries back on write.
+    let _lock = lock_index_exclusive(&index_dir)?;
     let files = collect_cct_layout(&source)?;
     let plan = build_plan(&index_dir, Some(source.clone()), files)?;
     if !needs_update(&plan) {
@@ -137,6 +142,7 @@ pub fn run_compact_cmd(args: cli::CompactCmd) -> Result<()> {
     if !index_dir.exists() {
         bail!("no index at {}", index_dir.display());
     }
+    let _lock = lock_index_exclusive(&index_dir)?;
     run_compact(&index_dir, only, args.target_segments, config)
 }
 
@@ -170,6 +176,7 @@ pub fn run_silent_update(index_dir: &Path) -> Result<()> {
     if !index_dir.exists() {
         return Ok(());
     }
+    let _lock = lock_index_exclusive(index_dir)?;
     let files = collect_cct_layout(&source)?;
     let plan = build_plan(index_dir, Some(source.clone()), files)?;
     if !needs_update(&plan) {
@@ -205,6 +212,8 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     let mut scan_elapsed = Duration::ZERO;
     let mut update_elapsed = Duration::ZERO;
     if !args.no_update {
+        // Released before the read-only search below; readers are not locked.
+        let _lock = lock_index_exclusive(&index_dir)?;
         if !index_dir.exists() {
             eprintln!("{DIM}Building initial index — this may take a while...{RESET}");
             let config = WriterConfig::for_full_reindex();
@@ -311,7 +320,9 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
 
     let mut delta_optimize_error: Option<String> = None;
     let delta_config = WriterConfig::for_delta_update();
-    let delta_optimize_elapsed = match optimize_delta(&index_dir, delta_config) {
+    let delta_optimize_elapsed = match lock_index_exclusive(&index_dir)
+        .and_then(|_lock| optimize_delta(&index_dir, delta_config))
+    {
         Ok(elapsed) => elapsed,
         Err(err) => {
             delta_optimize_error = Some(format!("{err:#}"));
