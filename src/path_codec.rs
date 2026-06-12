@@ -78,13 +78,29 @@ pub fn projects_dir() -> Result<PathBuf> {
 /// encoded from the cwd string Claude recorded, and resolving symlinks on macOS
 /// can change `/var/...` into `/private/var/...`.
 pub fn absolutize_lexical(path: &str) -> Result<PathBuf> {
-    let p = Path::new(path);
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
+    let expanded = expand_tilde(path);
+    let abs = if expanded.is_absolute() {
+        expanded
     } else {
-        std::env::current_dir()?.join(p)
+        std::env::current_dir()?.join(expanded)
     };
     Ok(clean_path_lexical(&abs))
+}
+
+/// Expand a leading `~` or `~/` to the home directory (e.g. a quoted `"~/foo"`
+/// the shell never expanded). Other forms — including `~user` — are returned
+/// unchanged.
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 pub fn clean_path_lexical(path: &Path) -> PathBuf {
@@ -173,6 +189,21 @@ mod tests {
         assert_eq!(
             clean_path_lexical(Path::new("/var/tmp/..")),
             PathBuf::from("/var")
+        );
+    }
+
+    #[test]
+    fn absolutize_lexical_expands_leading_tilde() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(absolutize_lexical("~").unwrap(), clean_path_lexical(&home));
+        assert_eq!(
+            absolutize_lexical("~/Temp/x").unwrap(),
+            clean_path_lexical(&home.join("Temp/x"))
+        );
+        // `~` only expands at the start; mid-path tilde stays literal.
+        assert_eq!(
+            absolutize_lexical("/abs/~/x").unwrap(),
+            PathBuf::from("/abs/~/x")
         );
     }
 }
