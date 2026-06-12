@@ -70,7 +70,15 @@ impl Spinner {
         }
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(self) {
+        // Drop does the actual cleanup; this name just marks intent.
+    }
+}
+
+/// Stops the spinner thread even when the owner bails with `?` between
+/// `start` and `stop` — otherwise it keeps drawing frames over the error.
+impl Drop for Spinner {
+    fn drop(&mut self) {
         self.done.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -240,33 +248,68 @@ fn original_span_for_lower_match(
     Some((original_start?, original_end?))
 }
 
-/// Truncate to at most `n` display columns, passing ANSI escapes through unmodified.
+/// Truncate to at most `n` display columns (wide chars count as 2), keeping
+/// SGR style sequences, dropping all other escape/control bytes, and closing
+/// any open style with RESET when the text is cut. The ellipsis is included
+/// in the budget, so the result never exceeds `n` columns.
 pub fn trunc_to_width(s: &str, n: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
     if n == 0 {
         return String::new();
     }
     let mut out = String::with_capacity(s.len());
-    let mut count = 0usize;
-    let mut in_esc = false;
-    for ch in s.chars() {
-        if in_esc {
-            out.push(ch);
-            if ch == 'm' {
-                in_esc = false;
-            }
-            continue;
-        }
+    let mut width = 0usize;
+    let mut styled = false;
+    let mut truncated = false;
+    // Widest prefix of `out` (bytes, styled-at-that-point) where '…' still fits.
+    let mut cut = (0usize, false);
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         if ch == '\x1b' {
-            out.push(ch);
-            in_esc = true;
+            if chars.peek() == Some(&'[') {
+                let mut seq = String::from("\x1b");
+                seq.push(chars.next().unwrap());
+                while matches!(chars.peek(), Some(c) if c.is_ascii_digit() || *c == ';') {
+                    seq.push(chars.next().unwrap());
+                }
+                match chars.peek() {
+                    // SGR (style) sequences pass through.
+                    Some('m') => {
+                        seq.push(chars.next().unwrap());
+                        out.push_str(&seq);
+                        styled = true;
+                    }
+                    // Any other CSI sequence is dropped wholesale.
+                    Some(c) if c.is_ascii_alphabetic() => {
+                        chars.next();
+                    }
+                    _ => {}
+                }
+            }
+            // A bare ESC (or unfinished sequence) is dropped.
             continue;
         }
-        if count >= n {
-            out.push('…');
-            return out;
+        if (ch as u32) < 32 || ch == '\u{7f}' {
+            continue;
+        }
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > n {
+            truncated = true;
+            break;
         }
         out.push(ch);
-        count += 1;
+        width += ch_width;
+        if width + 1 <= n {
+            cut = (out.len(), styled);
+        }
+    }
+    if truncated {
+        let (bytes, cut_styled) = cut;
+        out.truncate(bytes);
+        if cut_styled {
+            out.push_str(RESET);
+        }
+        out.push('…');
     }
     out
 }
@@ -295,5 +338,34 @@ mod tests {
     fn highlight_any_merges_overlapping_tokens() {
         let rendered = highlight_any("foobar", &["foo", "foobar"]);
         assert_eq!(rendered, format!("{RED}{BOLD}foobar{RESET}"));
+    }
+
+    #[test]
+    fn trunc_counts_display_columns_not_chars() {
+        // Four CJK chars are eight columns; with n=5 only two fit (4 cols)
+        // plus the ellipsis.
+        assert_eq!(trunc_to_width("漢字漢字", 5), "漢字…");
+        // Exact fit is not truncated.
+        assert_eq!(trunc_to_width("漢字", 4), "漢字");
+    }
+
+    #[test]
+    fn trunc_result_never_exceeds_limit() {
+        // "abcdef" at n=4 → 3 chars + ellipsis = exactly 4 columns.
+        assert_eq!(trunc_to_width("abcdef", 4), "abc…");
+        assert_eq!(trunc_to_width("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn trunc_closes_open_style_on_cut() {
+        let s = format!("{GREEN}{BOLD}long green title here{RESET}");
+        let cut = trunc_to_width(&s, 6);
+        assert!(cut.ends_with(&format!("{RESET}…")), "got {cut:?}");
+    }
+
+    #[test]
+    fn trunc_drops_non_sgr_escapes_and_controls() {
+        // A clear-screen CSI and a bare ESC must not leak through or eat text.
+        assert_eq!(trunc_to_width("a\x1b[2Jb\x1bc\x07d", 10), "abcd");
     }
 }
