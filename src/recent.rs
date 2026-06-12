@@ -89,11 +89,13 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
     Ok(())
 }
 
-/// Read whole jsonl lines from roughly the last `TAIL` bytes of a session log,
+const TAIL_BYTES: u64 = 256 * 1024;
+
+/// Read whole jsonl lines from roughly the last `TAIL_BYTES` of a session log,
 /// starting at a line boundary. Falls back to the whole file when it is small
 /// or the tail has no newline. Returns an empty vec on I/O error.
 fn read_session_tail(path: &Path) -> Vec<u8> {
-    const TAIL: u64 = 256 * 1024;
+    const TAIL: u64 = TAIL_BYTES;
     let Ok(meta) = fs::metadata(path) else {
         return Vec::new();
     };
@@ -138,10 +140,20 @@ pub fn session_activity_time_ms(path: &Path) -> i64 {
     }
 }
 
-/// The user-assigned session name (`/rename`), read from the file tail since the
-/// `custom-title` record lands near the end of the log.
+/// The user-assigned session name (`/rename`). The `custom-title` record sits
+/// wherever the rename happened, so the cheap tail read is only a fast path —
+/// when the session grew past the tail window since the rename, a full read
+/// is needed to find it.
 pub fn session_title(path: &Path) -> Option<String> {
-    crate::text::extract_session_title(&read_session_tail(path))
+    if let Some(title) = crate::text::extract_session_title(&read_session_tail(path)) {
+        return Some(title);
+    }
+    let total = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if total <= TAIL_BYTES {
+        return None;
+    }
+    let data = fs::read(path).ok()?;
+    crate::text::extract_session_title(&data)
 }
 
 /// Returns `(tail_pairs, total_prompts, tool_calls, bytes, title)`.
@@ -375,8 +387,14 @@ pub fn first_user_prompt(path: &Path) -> Option<String> {
         if line.is_empty() {
             continue;
         }
-        let parsed: JsonValue = serde_json::from_str(line).ok()?;
-        let obj = parsed.as_object()?;
+        // Skip malformed lines (e.g. a torn write from a crashed session)
+        // instead of giving up on the whole file.
+        let Ok(parsed) = serde_json::from_str::<JsonValue>(line) else {
+            continue;
+        };
+        let Some(obj) = parsed.as_object() else {
+            continue;
+        };
         if obj.get("type").and_then(|v| v.as_str()) != Some("user") {
             continue;
         }
