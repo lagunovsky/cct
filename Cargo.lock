@@ -193,6 +193,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "unicode-width",
+ "zstd",
 ]
 
 [[package]]

@@ -39,6 +39,8 @@ pub const KNOWN_SUBCOMMANDS: &[&str] = &[
     "d",
     "cleanup-period",
     "cp",
+    "archive",
+    "unarchive",
     "help",
 ];
 
@@ -99,6 +101,12 @@ pub enum Cmd {
     /// Show or set Claude Code's session retention (cleanupPeriodDays).
     #[command(visible_alias = "cp", name = "cleanup-period")]
     CleanupPeriod(CleanupPeriodCmd),
+
+    /// Move cold sessions into a zstd-compressed archive (search keeps working).
+    Archive(ArchiveCmd),
+
+    /// Restore archived sessions back into ~/.claude/projects.
+    Unarchive(UnarchiveCmd),
 }
 
 #[derive(Args, Debug)]
@@ -232,6 +240,37 @@ pub struct TransferCmd {
     /// Optional session ids (UUIDs or unique prefixes). Without ids: interactive picker.
     #[arg(num_args = 0..)]
     pub session_ids: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ArchiveCmd {
+    /// Archive sessions whose last activity is older than this (90d, 3m, 1y, or days).
+    #[arg(long = "older-than", default_value = "90d")]
+    pub older_than: String,
+
+    /// Restrict to one project path (default: all projects).
+    #[arg(short = 'p', long = "project")]
+    pub project: Option<String>,
+
+    /// Show what would be archived but don't write.
+    #[arg(long = "dry-run", default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Skip the y/N prompt.
+    #[arg(short = 'y', long = "yes", default_value_t = false)]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UnarchiveCmd {
+    /// Keep the original mtime instead of stamping the restore time. Note:
+    /// Claude Code's age-based cleanup may then reap the session right away.
+    #[arg(long = "keep-mtime", default_value_t = false)]
+    pub keep_mtime: bool,
+
+    /// Session ids (or unique prefixes) to restore.
+    #[arg(required = true, num_args = 1..)]
+    pub ids: Vec<String>,
 }
 
 #[derive(Args, Debug)]

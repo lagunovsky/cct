@@ -39,7 +39,37 @@ pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
             cli::DaemonAction::Update => crate::daemon::run_background_update(),
         },
         Some(cli::Cmd::CleanupPeriod(args)) => run_cleanup_period(args),
+        Some(cli::Cmd::Archive(args)) => run_archive_cmd(args),
+        Some(cli::Cmd::Unarchive(args)) => {
+            crate::archive::run_unarchive(&args.ids, args.keep_mtime)
+        }
     }
+}
+
+fn run_archive_cmd(args: cli::ArchiveCmd) -> Result<()> {
+    let older_than_days = crate::archive::parse_age_days(&args.older_than)?;
+    let project = args
+        .project
+        .as_deref()
+        .map(absolutize_lexical)
+        .transpose()?;
+    let index_dir = index_root()?;
+    // Flush pending delta ranges first (under the same lock the daemon uses):
+    // a session with un-flushed appends would lose its tail from the index
+    // when the live file disappears mid-flush.
+    let _lock = if index_dir.exists() && !args.dry_run {
+        let lock = lock_index_exclusive(&index_dir)?;
+        flush_delta(&index_dir, WriterConfig::for_incremental_update(), false)?;
+        Some(lock)
+    } else {
+        None
+    };
+    crate::archive::run_archive(crate::archive::ArchiveOptions {
+        older_than_days,
+        project,
+        dry_run: args.dry_run,
+        skip_confirm: args.yes,
+    })
 }
 
 fn run_cleanup_period(args: cli::CleanupPeriodCmd) -> Result<()> {

@@ -103,6 +103,12 @@ pub fn build_plan_scoped(
                 continue;
             }
         }
+        // A session moved to the archive keeps its index documents: the live
+        // file is gone from the scan, but that must not read as a deletion.
+        if !scanned.contains_key(&entry.path) && crate::archive::is_archived(&entry.path) {
+            preserved.push(entry);
+            continue;
+        }
         catalog_by_path.insert(entry.path.clone(), entry);
     }
 

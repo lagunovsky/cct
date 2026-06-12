@@ -193,6 +193,23 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 | `cct daemon uninstall` | Remove launchd job |
 | `cct daemon update` | Background update entry point used by launchd |
 | `cct cleanup-period [days]` | Show or set Claude Code's transcript retention (`cleanupPeriodDays` in `~/.claude/settings.json`); flags: `--no-warn`, `--warn` |
+| `cct archive` | Move cold sessions into `~/.claude/archive` (zstd); flags: `--older-than` (default 90d), `-p`, `--dry-run`, `-y` |
+| `cct unarchive <ids...>` | Restore archived sessions back into `~/.claude/projects`; flag: `--keep-mtime` |
+
+## Archiving
+
+`cct archive` moves sessions whose last activity is older than `--older-than`
+(default 90 days) into `~/.claude/archive`, mirroring the projects layout with
+each file zstd-compressed (~4-8x smaller on real logs). The search index keeps
+its documents: archived sessions still come up in `cct search`, snippets are
+served by on-the-fly decompression, and results are marked `[archived]`.
+Restoring with `cct unarchive <id>` brings the session back for
+`claude --resume`; the restored file gets a fresh mtime so Claude Code's
+age-based cleanup doesn't immediately reap it (pass `--keep-mtime` to
+preserve the original timestamp instead — at your own cleanup risk).
+
+Limitations: archived sessions don't appear in `cct recent` or the transfer
+picker, and `cct rename`/`cct transfer` skip them — unarchive first.
 
 ## Session retention
 

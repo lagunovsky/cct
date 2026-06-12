@@ -3,6 +3,7 @@
 //! The binary at `src/main.rs` is a thin CLI wrapper; everything reusable lives
 //! here so integration tests can drive it directly.
 
+pub mod archive;
 pub mod cli;
 pub mod commands;
 pub mod config;

@@ -79,6 +79,8 @@ pub struct SessionResult {
     pub last_msg_ms: i64,
     pub display_stats: Option<DisplayStats>,
     pub title: Option<String>,
+    /// The session lives in the zstd archive, not under `~/.claude/projects`.
+    pub archived: bool,
 }
 
 pub fn select_indexes(mode: SearchMode, query: &str) -> Vec<IndexKind> {
@@ -232,8 +234,10 @@ fn build_session_results(
                 last_msg_ms: 0,
                 display_stats: catalog.map(|_| DisplayStats::default()),
                 title: None,
+                archived: false,
             });
         entry.sources.insert(source);
+        entry.archived |= !path.exists() && crate::archive::is_archived(&path);
         entry.files.insert(path.clone());
         apply_catalog_display_stats(entry, &path, catalog.map(|c| &c.stats));
         if let Some(catalog) = catalog {
@@ -265,7 +269,14 @@ fn build_session_results(
         }
 
         if entry.last_msg_ms == 0 {
-            if let Ok(meta) = fs::metadata(&path) {
+            // Archived twins carry over the original mtime, so they serve as
+            // the fallback when the live file is gone.
+            let meta = fs::metadata(&path).or_else(|_| {
+                crate::archive::archive_path_for(&path)
+                    .map(fs::metadata)
+                    .unwrap_or_else(|| Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+            });
+            if let Ok(meta) = meta {
                 if let Ok(modified) = meta.modified() {
                     if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
                         entry.last_msg_ms = d.as_millis() as i64;
@@ -438,6 +449,14 @@ fn snippets_for_hits(
         .collect();
     let mut budget = 6usize;
 
+    // Archived sessions: the live file is gone — decompress the zstd twin
+    // once and serve every hit range from memory.
+    let archived_data: Option<Vec<u8>> = if path.exists() {
+        None
+    } else {
+        crate::archive::read_archived(path)
+    };
+
     for hit in hits {
         if budget == 0 {
             break;
@@ -456,10 +475,19 @@ fn snippets_for_hits(
             }
             continue;
         };
-        let Ok(bytes) = read_file_range(path, start, end) else {
-            continue;
+        let range_data: Vec<u8>;
+        let raw: &[u8] = if let Some(data) = &archived_data {
+            let s = (start as usize).min(data.len());
+            let e = (end as usize).min(data.len()).max(s);
+            &data[s..e]
+        } else {
+            let Ok(bytes) = read_file_range(path, start, end) else {
+                continue;
+            };
+            range_data = bytes;
+            &range_data
         };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
+        let Ok(text) = std::str::from_utf8(raw) else {
             continue;
         };
         let lines = split_keep_offsets(text);
@@ -842,8 +870,13 @@ pub fn print_session_header(s: &SessionResult, prompts: u32, tools: u32, bytes: 
         Some(t) if !t.is_empty() => format!("  {GREEN}{BOLD}{t}{RESET}"),
         _ => String::new(),
     };
+    let archived = if s.archived {
+        format!("  {DIM}[archived — cct unarchive {id} to resume]{RESET}", id = s.session_id)
+    } else {
+        String::new()
+    };
     println!(
-        "\n{CYAN}{BOLD}{id}{RESET}{title}  {DIM}{project}{RESET}{stats}",
+        "\n{CYAN}{BOLD}{id}{RESET}{title}  {DIM}{project}{RESET}{stats}{archived}",
         id = s.session_id,
         project = s.project,
     );
