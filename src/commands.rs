@@ -1,6 +1,6 @@
 //! Top-level command implementations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 
 use crate::cli;
-use crate::fs_scan::{collect_cct_layout, collect_one_project};
+use crate::fs_scan::{
+    collect_archived_layout, collect_cct_layout, collect_one_project, DiscoveredFile,
+};
 use crate::index::build::run_full_reindex;
 use crate::index::catalog::lock_index_exclusive;
 use crate::index::compact::{optimize_delta, run_compact};
@@ -212,6 +214,25 @@ fn writer_config_for_compact(args: &cli::CompactCmd) -> Result<WriterConfig> {
     Ok(config)
 }
 
+/// Files for a full reindex: live sessions plus archived ones mapped back to
+/// their logical live paths, so a from-scratch rebuild keeps serving the
+/// archive. Incremental updates preserve archived docs already in the catalog,
+/// but a full reindex starts from an empty index and would otherwise drop them.
+fn collect_for_full_reindex(source: &Path) -> Result<Vec<DiscoveredFile>> {
+    let mut files = collect_cct_layout(source)?;
+    let archive = crate::archive::archive_root()?;
+    let mut seen: HashSet<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+    for f in collect_archived_layout(&archive, source)? {
+        // A live file and its archive twin can momentarily coexist mid-archive;
+        // prefer the live copy and never index the same session twice.
+        if seen.insert(f.path.clone()) {
+            files.push(f);
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
 pub fn run_reindex(args: cli::ReindexCmd) -> Result<()> {
     maybe_warn_short_cleanup_period();
     let config = writer_config_for_reindex(&args)?;
@@ -219,7 +240,7 @@ pub fn run_reindex(args: cli::ReindexCmd) -> Result<()> {
     let enabled = only.unwrap_or_else(IndexKind::all);
     let source = projects_dir()?;
     let index_dir = index_root()?;
-    let files = collect_cct_layout(&source)?;
+    let files = collect_for_full_reindex(&source)?;
     let start = Instant::now();
     let _lock = lock_index_exclusive(&index_dir)?;
     run_full_reindex(&source, &index_dir, &enabled, files, config, true)?;
@@ -328,7 +349,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
             maybe_warn_short_cleanup_period();
             eprintln!("{DIM}Building initial index — this may take a while...{RESET}");
             let config = WriterConfig::for_full_reindex();
-            let files = collect_cct_layout(&source)?;
+            let files = collect_for_full_reindex(&source)?;
             let upd_start = Instant::now();
             run_full_reindex(
                 &source,

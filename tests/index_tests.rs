@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use cct::fs_scan::{collect_cct_layout, collect_one_project};
+use cct::fs_scan::{collect_archived_layout, collect_cct_layout, collect_one_project};
 use cct::index::build::{run_full_reindex, subindex_segment_count};
 use cct::index::catalog::{read_catalog, read_delta_catalog};
 use cct::index::compact::{optimize_delta, DELTA_OPTIMIZE_MIN_SEGMENTS};
@@ -1017,5 +1017,59 @@ fn scoped_update_leaves_other_projects_intact() -> Result<()> {
     );
     // The other project is untouched: same term still resolves to its session.
     assert_session(&fx.search("OTHERTERM", SearchMode::Auto), "session-other");
+    Ok(())
+}
+
+#[test]
+fn full_reindex_includes_archived_sessions() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Old timestamp so the session is "cold" regardless of the wall clock.
+    let session = fx.write_session(
+        "zebra-session",
+        &format!(
+            "{}\n{}\n",
+            jsonl_custom_title("zebra-archived-title"),
+            r#"{"type":"user","timestamp":"2020-01-01T00:00:00Z","message":{"content":"distinctivezebraword appears here"}}"#,
+        ),
+    );
+
+    // Archive it into a sibling archive dir; the live jsonl is removed.
+    let archive = fx.source.parent().unwrap().join("archive");
+    cct::archive::run_archive_in(
+        cct::archive::ArchiveOptions {
+            older_than_days: 0,
+            project: None,
+            dry_run: false,
+            skip_confirm: true,
+            quiet: true,
+        },
+        &fx.source,
+        &archive,
+    )?;
+    assert!(!session.exists(), "live session should be gone after archive");
+
+    // A live-only reindex drops the archived session — the bug being fixed.
+    fx.full_reindex()?;
+    assert!(
+        fx.search("distinctivezebraword", SearchMode::Auto).is_empty(),
+        "live-only reindex must not surface the archived session"
+    );
+
+    // A reindex that also feeds the archive serves it again.
+    let mut files = collect_cct_layout(&fx.source)?;
+    files.extend(collect_archived_layout(&archive, &fx.source)?);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    run_full_reindex(
+        &fx.source,
+        &fx.index_dir,
+        &IndexKind::all(),
+        files,
+        WriterConfig::for_full_reindex(),
+        false,
+    )?;
+    assert_session(
+        &fx.search("distinctivezebraword", SearchMode::Auto),
+        "zebra-session",
+    );
     Ok(())
 }

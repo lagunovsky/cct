@@ -243,7 +243,25 @@ pub fn add_whole_file(
     file_id: u64,
 ) -> Result<(CatalogEntry, u64)> {
     let before_read = file_identity(&file.path).ok();
-    let data = fs::read(&file.path).with_context(|| format!("read {}", file.path.display()))?;
+    // Archived sessions carry their bytes in a `.zst` twin; live files read
+    // straight from `path`. Either way, every path-derived field below (kind,
+    // project id, title, catalog `path`) keys off the logical live `path`.
+    let data = match &file.zst_source {
+        Some(zst) => crate::archive::read_zst(zst)?,
+        None => match fs::read(&file.path) {
+            Ok(data) => data,
+            // The session can be archived between scan and read (`cct archive`
+            // doesn't hold the index lock). Its bytes now live in the zstd
+            // twin — index from there instead of dropping the session until
+            // the next full reindex.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                crate::archive::read_archived(&file.path)
+                    .ok_or(err)
+                    .with_context(|| format!("read {}", file.path.display()))?
+            }
+            Err(err) => return Err(err).with_context(|| format!("read {}", file.path.display())),
+        },
+    };
     let after_read = file_identity(&file.path).ok();
     let (size, mtime_ms) = catalog_identity_for_read(file, data.len(), before_read, after_read);
     let indexed_len = indexable_prefix_len(&file.path, &data);

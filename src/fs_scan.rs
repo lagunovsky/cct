@@ -32,6 +32,10 @@ pub struct DiscoveredFile {
     pub kind: FileKind,
     pub size: u64,
     pub mtime_ms: u128,
+    /// When set, `path` is a logical live path whose bytes only exist compressed
+    /// at this `.zst` source (an archived session); the indexer decompresses it
+    /// instead of reading `path`. `None` for ordinary live files.
+    pub zst_source: Option<PathBuf>,
 }
 
 /// Walk `~/.claude/projects/` in the cct layout:
@@ -109,6 +113,106 @@ pub fn collect_one_project(project_session_dir: &Path) -> Result<Vec<DiscoveredF
     Ok(out)
 }
 
+/// Walk the zstd archive mirror under `archive_root` — built by `cct archive`,
+/// which duplicates the projects layout with `.zst` appended to every file —
+/// and map each entry back to the logical live path it stands in for under
+/// `projects_root`. A full reindex feeds these alongside live files so a
+/// from-scratch rebuild keeps the archive searchable (incremental updates
+/// preserve archived docs already in the catalog, but a full reindex starts
+/// empty). The returned `path` is the live path; `zst_source` points at the
+/// compressed file the indexer decompresses; `size`/`mtime_ms` come from it.
+pub fn collect_archived_layout(
+    archive_root: &Path,
+    projects_root: &Path,
+) -> Result<Vec<DiscoveredFile>> {
+    let mut out = Vec::new();
+    if !archive_root.is_dir() {
+        return Ok(out);
+    }
+    collect_archived_dir(archive_root, archive_root, projects_root, &mut out)?;
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn collect_archived_dir(
+    dir: &Path,
+    archive_root: &Path,
+    projects_root: &Path,
+    out: &mut Vec<DiscoveredFile>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let path = entry.path();
+        if ty.is_dir() {
+            collect_archived_dir(&path, archive_root, projects_root, out)?;
+        } else if ty.is_file() {
+            let Some(live) = archived_live_path(&path, archive_root, projects_root) else {
+                continue;
+            };
+            let Some(kind) = classify_live_path(&live, projects_root) else {
+                continue;
+            };
+            push_archived_file(out, live, kind, path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Invert `archive::archive_path_for_roots`: drop the archive root prefix and
+/// the trailing `.zst` to recover the live path under `projects_root`.
+fn archived_live_path(
+    archived: &Path,
+    archive_root: &Path,
+    projects_root: &Path,
+) -> Option<PathBuf> {
+    let rel = archived.strip_prefix(archive_root).ok()?;
+    let live_rel = rel.to_string_lossy();
+    let live_rel = live_rel.strip_suffix(".zst")?;
+    Some(projects_root.join(live_rel))
+}
+
+/// Classify a live path by its slot in the cct layout, mirroring exactly what
+/// `collect_project` / `collect_session_subdirs` accept for live files:
+///   `<project>/<id>.jsonl`                    → session
+///   `<project>/<id>/subagents/*.jsonl`        → subagent
+///   `<project>/<id>/tool-results/*.<textext>` → tool result
+fn classify_live_path(live: &Path, projects_root: &Path) -> Option<FileKind> {
+    let rel = live.strip_prefix(projects_root).ok()?;
+    let comps: Vec<&std::ffi::OsStr> = rel.components().map(|c| c.as_os_str()).collect();
+    let ext = live.extension().and_then(|s| s.to_str());
+    match comps.len() {
+        2 if ext == Some("jsonl") => Some(FileKind::SessionJsonl),
+        4 => match comps[2].to_str() {
+            Some("subagents") if ext == Some("jsonl") => Some(FileKind::SubagentJsonl),
+            Some("tool-results") if is_text_like_tool_result(live) => Some(FileKind::ToolResult),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn push_archived_file(
+    out: &mut Vec<DiscoveredFile>,
+    live: PathBuf,
+    kind: FileKind,
+    archived: PathBuf,
+) -> Result<()> {
+    let meta = match fs::metadata(&archived) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", archived.display())),
+    };
+    out.push(DiscoveredFile {
+        path: live,
+        kind,
+        size: meta.len(),
+        mtime_ms: metadata_mtime_ms(&meta),
+        zst_source: Some(archived),
+    });
+    Ok(())
+}
+
 fn collect_project(project_path: &Path, out: &mut Vec<DiscoveredFile>) -> Result<()> {
     let entries = fs::read_dir(project_path)
         .with_context(|| format!("read dir {}", project_path.display()))?;
@@ -176,19 +280,22 @@ fn push_file(out: &mut Vec<DiscoveredFile>, path: PathBuf, kind: FileKind) -> Re
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
     };
-    let mtime_ms = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
     out.push(DiscoveredFile {
         path,
         kind,
         size: meta.len(),
-        mtime_ms,
+        mtime_ms: metadata_mtime_ms(&meta),
+        zst_source: None,
     });
     Ok(())
+}
+
+fn metadata_mtime_ms(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 pub fn is_text_like_tool_result(path: &Path) -> bool {
@@ -200,4 +307,66 @@ pub fn is_text_like_tool_result(path: &Path) -> bool {
 
 pub fn is_appendable_jsonl(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_archived_layout_maps_zst_back_to_live_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("archive");
+        let projects = tmp.path().join("projects");
+        let proj = archive.join("-Users-x-proj");
+        fs::create_dir_all(proj.join("abc/subagents")).unwrap();
+        fs::create_dir_all(proj.join("abc/tool-results")).unwrap();
+        // Content is irrelevant here: discovery only maps paths and stats size.
+        fs::write(proj.join("abc.jsonl.zst"), b"z").unwrap();
+        fs::write(proj.join("abc/subagents/a1.jsonl.zst"), b"z").unwrap();
+        fs::write(proj.join("abc/tool-results/t.txt.zst"), b"z").unwrap();
+        // A non-text tool result is skipped, just like on the live side.
+        fs::write(proj.join("abc/tool-results/img.png.zst"), b"z").unwrap();
+
+        let found = collect_archived_layout(&archive, &projects).unwrap();
+        let mut mapped: Vec<(String, &str, bool)> = found
+            .iter()
+            .map(|f| {
+                (
+                    f.path
+                        .strip_prefix(&projects)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    f.kind.as_str(),
+                    f.zst_source.is_some(),
+                )
+            })
+            .collect();
+        mapped.sort();
+        assert_eq!(
+            mapped,
+            vec![
+                ("-Users-x-proj/abc.jsonl".to_string(), "session_jsonl", true),
+                (
+                    "-Users-x-proj/abc/subagents/a1.jsonl".to_string(),
+                    "subagent_jsonl",
+                    true
+                ),
+                (
+                    "-Users-x-proj/abc/tool-results/t.txt".to_string(),
+                    "tool_result",
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_archived_layout_absent_root_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let found =
+            collect_archived_layout(&tmp.path().join("nope"), &tmp.path().join("projects")).unwrap();
+        assert!(found.is_empty());
+    }
 }

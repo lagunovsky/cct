@@ -670,6 +670,7 @@ mod tests {
             kind: FileKind::SessionJsonl,
             size,
             mtime_ms,
+            zst_source: None,
         }
     }
 

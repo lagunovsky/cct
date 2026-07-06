@@ -57,9 +57,14 @@ pub fn is_archived(live: &Path) -> bool {
 /// Decompress the archived twin of `live` in full. Returns None when there
 /// is no archive or it cannot be read.
 pub fn read_archived(live: &Path) -> Option<Vec<u8>> {
-    let path = archive_path_for(live)?;
-    let file = File::open(path).ok()?;
-    zstd::stream::decode_all(file).ok()
+    read_zst(&archive_path_for(live)?).ok()
+}
+
+/// Decompress a `.zst` file fully into memory. Used at index time to feed an
+/// archived session's content to the indexer from its compressed source.
+pub fn read_zst(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    zstd::stream::decode_all(file).with_context(|| format!("decompress {}", path.display()))
 }
 
 /// Compress `src` into `dst` (atomically via tmp+rename), carrying over the
