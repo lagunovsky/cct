@@ -217,30 +217,52 @@ pub fn rewrite_slash_command(s: &str) -> Option<String> {
     }
 }
 
-/// The user-assigned session name set via `/rename`, stored in the log as a
-/// `{"type":"custom-title","customTitle":"…"}` record. A session can be renamed
-/// more than once, so the last non-empty title wins. Returns `None` when the
-/// session was never named.
+/// The session name Claude Code renders in its picker. When a session is named
+/// — via `/rename`, explicit or auto — Claude Code writes an
+/// `{"type":"agent-name","agentName":"…"}` record. A forked session instead gets
+/// only a placeholder `{"type":"custom-title","customTitle":"… (Branch)"}` and no
+/// `agent-name`, and Claude Code shows no name for it; so neither do we.
+///
+/// Preference order, mirroring Claude Code:
+///   1. the last non-empty `agent-name`;
+///   2. otherwise the last non-empty `custom-title`, unless it is a `(Branch)`
+///      placeholder — the fallback covers pre-`agent-name` sessions that only
+///      ever wrote `custom-title`.
+///
+/// A session can be renamed more than once, so the last record of each kind
+/// wins. Returns `None` when the session was never named.
 pub fn extract_session_title(data: &[u8]) -> Option<String> {
-    let mut title = None;
+    let mut agent_name = None;
+    let mut custom_title = None;
     for line in data.split(|b| *b == b'\n') {
         // Cheap byte prefilter so we only JSON-parse the rare title records.
-        if !slice_contains(line, b"\"custom-title\"") {
+        let has_agent = slice_contains(line, b"\"agent-name\"");
+        let has_custom = !has_agent && slice_contains(line, b"\"custom-title\"");
+        if !has_agent && !has_custom {
             continue;
         }
         let Ok(value) = serde_json::from_slice::<JsonValue>(line) else {
             continue;
         };
-        if value.get("type").and_then(|t| t.as_str()) != Some("custom-title") {
-            continue;
-        }
-        if let Some(t) = value.get("customTitle").and_then(|t| t.as_str()) {
-            if !t.is_empty() {
-                title = Some(t.to_string());
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("agent-name") => {
+                if let Some(t) = value.get("agentName").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        agent_name = Some(t.to_string());
+                    }
+                }
             }
+            Some("custom-title") => {
+                if let Some(t) = value.get("customTitle").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        custom_title = Some(t.to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    title
+    agent_name.or_else(|| custom_title.filter(|t| !t.ends_with(" (Branch)")))
 }
 
 fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -319,10 +341,64 @@ mod tests {
     use super::extract_session_title;
 
     #[test]
-    fn extract_session_title_picks_last_custom_title() {
+    fn extract_session_title_picks_last_agent_name() {
         let data = concat!(
             r#"{"type":"user","message":{"content":"hi"}}"#,
             "\n",
+            r#"{"type":"agent-name","agentName":"first","sessionId":"x"}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":"second","sessionId":"x"}"#,
+            "\n",
+        );
+        assert_eq!(extract_session_title(data.as_bytes()).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn extract_session_title_prefers_agent_name_over_custom_title() {
+        // `/rename` writes both records; the picker renders `agent-name`.
+        let data = concat!(
+            r#"{"type":"custom-title","customTitle":"stale","sessionId":"x"}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":"real-name","sessionId":"x"}"#,
+            "\n",
+        );
+        assert_eq!(
+            extract_session_title(data.as_bytes()).as_deref(),
+            Some("real-name")
+        );
+    }
+
+    #[test]
+    fn extract_session_title_ignores_branch_placeholder() {
+        // A fork gets only a `(Branch)` custom-title and no agent-name; Claude
+        // Code shows no name for it.
+        let data =
+            r#"{"type":"custom-title","customTitle":"do the thing (Branch)","sessionId":"x"}"#;
+        assert_eq!(extract_session_title(data.as_bytes()), None);
+    }
+
+    #[test]
+    fn extract_session_title_forked_then_renamed_uses_agent_name() {
+        // A forked session that was later renamed has both the `(Branch)`
+        // placeholder and a real agent-name; the agent-name wins.
+        let data = concat!(
+            r#"{"type":"custom-title","customTitle":"do the thing (Branch)","sessionId":"x"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"my-name","sessionId":"x"}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":"my-name","sessionId":"x"}"#,
+            "\n",
+        );
+        assert_eq!(
+            extract_session_title(data.as_bytes()).as_deref(),
+            Some("my-name")
+        );
+    }
+
+    #[test]
+    fn extract_session_title_falls_back_to_custom_title_when_no_agent_name() {
+        // Pre-`agent-name` sessions only ever wrote `custom-title`.
+        let data = concat!(
             r#"{"type":"custom-title","customTitle":"first","sessionId":"x"}"#,
             "\n",
             r#"{"type":"custom-title","customTitle":"second","sessionId":"x"}"#,
@@ -339,7 +415,11 @@ mod tests {
 
     #[test]
     fn extract_session_title_ignores_empty() {
-        let data = r#"{"type":"custom-title","customTitle":"","sessionId":"x"}"#;
+        let data = concat!(
+            r#"{"type":"custom-title","customTitle":"","sessionId":"x"}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":"","sessionId":"x"}"#,
+        );
         assert_eq!(extract_session_title(data.as_bytes()), None);
     }
 }

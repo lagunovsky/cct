@@ -140,10 +140,11 @@ pub fn session_activity_time_ms(path: &Path) -> i64 {
     }
 }
 
-/// The user-assigned session name (`/rename`). The `custom-title` record sits
-/// wherever the rename happened, so the cheap tail read is only a fast path —
-/// when the session grew past the tail window since the rename, a full read
-/// is needed to find it.
+/// The session name Claude Code shows (`agent-name`, falling back to a
+/// non-`(Branch)` `custom-title`; see [`crate::text::extract_session_title`]).
+/// The record sits wherever the rename happened, so the cheap tail read is only
+/// a fast path — when the session grew past the tail window since the rename, a
+/// full read is needed to find it.
 pub fn session_title(path: &Path) -> Option<String> {
     if let Some(title) = crate::text::extract_session_title(&read_session_tail(path)) {
         return Some(title);
