@@ -39,6 +39,7 @@ cct "марат"                      # same — a bare argument implies `search
 cct search -g "API error"        # global search across all projects
 cct search -p ../other "TODO"    # search a different project
 cct search -n 50 -c 200 "trace"
+cct search "auth" "timeout"      # AND: session must contain all strings
 cct reindex                      # rebuild the index from scratch
 cct update                       # incremental update (also runs implicitly on search)
 cct compact                      # collapse Tantivy segments to a single one
@@ -92,6 +93,11 @@ adds:
 - **path** when the query contains `/`, `\`, or `~`.
 
 You can pin to a specific backend with `--mode word|trigram|path|all`.
+
+Multiple query arguments are AND-ed at the session level: each string may
+match anywhere in the session (main log, subagent log, or tool result), and
+only sessions containing all of them are returned. Index selection above is
+per string. Within a single string, tokens must co-occur in nearby context.
 
 Multi-word queries are AND-ed and matched as a phrase on one line by default.
 Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets

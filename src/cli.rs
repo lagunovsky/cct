@@ -151,7 +151,8 @@ pub struct SearchCmd {
     #[arg(long = "mode", value_enum, default_value_t = SearchMode::Auto)]
     pub mode: SearchMode,
 
-    /// Query string. Tokens are AND-ed together.
+    /// Query strings; a session must match all of them (AND), anywhere in the
+    /// session. Tokens inside one string are AND-ed in nearby context.
     #[arg(required = true, num_args = 1..)]
     pub query: Vec<String>,
 }

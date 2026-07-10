@@ -47,7 +47,10 @@ pub struct DocHit {
 }
 
 pub struct SearchOptions {
-    pub query: String,
+    /// Query strings. A session must match every one of them (AND); the
+    /// strings may match in different places — even different files — of the
+    /// session. Tokens inside one string keep the tighter same-chunk AND.
+    pub queries: Vec<String>,
     pub mode: SearchMode,
     pub limit: usize,
     pub context_chars: usize,
@@ -61,6 +64,8 @@ pub struct DisplayStats {
     pub tools: u32,
     pub bytes: u64,
 }
+
+const MAX_SNIPPETS_PER_SESSION: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct Snippet {
@@ -130,23 +135,16 @@ pub fn looks_pathish(q: &str) -> bool {
 }
 
 pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionResult>> {
-    if opts.query.trim().is_empty() {
+    let queries: Vec<&str> = opts
+        .queries
+        .iter()
+        .map(|q| q.trim())
+        .filter(|q| !q.is_empty())
+        .collect();
+    if queries.is_empty() {
         bail!("empty query");
     }
-    let mut kinds = select_indexes(opts.mode, &opts.query);
-    // The ngram(3,3) tokenizer yields no tokens for queries shorter than three
-    // chars; drop such subindexes instead of letting build_query fail the
-    // whole search (e.g. `c/` enables Path in auto mode).
-    kinds.retain(|kind| {
-        query_tokens(*kind, &opts.query)
-            .map(|tokens| !tokens.is_empty())
-            .unwrap_or(true)
-    });
-    if kinds.is_empty() {
-        bail!("query contains no searchable tokens");
-    }
 
-    let mut hits: Vec<DocHit> = Vec::new();
     let limit = candidate_limit(opts.limit);
     let project_id = opts
         .project_prefix
@@ -154,35 +152,142 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
         .map(|path| path.to_string_lossy().into_owned());
     let delta = delta_dir(index_dir);
     let roots = [index_dir.to_path_buf(), delta];
-    for root in roots {
-        for kind in &kinds {
-            let dir = subindex_dir(&root, *kind);
-            if !dir.exists() {
-                continue;
+
+    // Phase 1: index hits per query string, kept separate — the AND below is
+    // at session level, not chunk level, so the strings must not be merged
+    // into one boolean query.
+    let mut per_query_groups: Vec<BTreeMap<PathBuf, Vec<DocHit>>> = Vec::new();
+    for query in &queries {
+        let mut kinds = select_indexes(opts.mode, query);
+        // The ngram(3,3) tokenizer yields no tokens for queries shorter than
+        // three chars; drop such subindexes instead of letting build_query
+        // fail the whole search (e.g. `c/` enables Path in auto mode).
+        kinds.retain(|kind| {
+            query_tokens(*kind, query)
+                .map(|tokens| !tokens.is_empty())
+                .unwrap_or(true)
+        });
+        if kinds.is_empty() {
+            bail!("no searchable tokens in {query:?}");
+        }
+        let mut hits: Vec<DocHit> = Vec::new();
+        for root in &roots {
+            for kind in &kinds {
+                let dir = subindex_dir(root, *kind);
+                if !dir.exists() {
+                    continue;
+                }
+                let rows = search_one_index(root, *kind, query, project_id.as_deref(), limit)
+                    .with_context(|| {
+                        format!("search {} index at {}", kind.as_str(), dir.display())
+                    })?;
+                hits.extend(rows);
             }
-            let rows = search_one_index(&root, *kind, &opts.query, project_id.as_deref(), limit)
-                .with_context(|| format!("search {} index at {}", kind.as_str(), dir.display()))?;
-            hits.extend(rows);
+        }
+        if let Some(prefix) = &opts.project_prefix {
+            hits.retain(|h| h.path.starts_with(prefix));
+        }
+        per_query_groups.push(group_hits_by_file(hits));
+    }
+
+    // Phase 2: AND across query strings — a session survives only when every
+    // string matched somewhere in it. Files of dropped sessions are pruned
+    // before the expensive snippet phase.
+    if per_query_groups.len() > 1 {
+        let session_sets: Vec<BTreeSet<String>> = per_query_groups
+            .iter()
+            .map(|groups| groups.keys().map(|p| parse_file_path(p).0).collect())
+            .collect();
+        let mut alive = session_sets[0].clone();
+        for set in &session_sets[1..] {
+            alive.retain(|id| set.contains(id));
+        }
+        for groups in &mut per_query_groups {
+            groups.retain(|path, _| alive.contains(&parse_file_path(path).0));
         }
     }
 
-    if let Some(prefix) = &opts.project_prefix {
-        hits.retain(|h| h.path.starts_with(prefix));
+    // Phase 3: snippets and session assembly per query string, then merge.
+    let catalog = load_catalog_render(index_dir)?;
+    let mut merged: BTreeMap<String, SessionResult> = BTreeMap::new();
+    // Per-session snippet lists, one slot per query string, so the final list
+    // can interleave them — appending would let the first string's snippets
+    // crowd the later ones out of the per-session cap entirely.
+    let mut snippet_rounds: BTreeMap<String, Vec<Vec<Snippet>>> = BTreeMap::new();
+    for (query, groups) in queries.iter().zip(per_query_groups) {
+        let by_session =
+            build_session_results(groups, query, opts.context_chars, opts.fuzzy, catalog.as_ref());
+        for (id, mut result) in by_session {
+            snippet_rounds
+                .entry(id.clone())
+                .or_default()
+                .push(std::mem::take(&mut result.snippets));
+            match merged.entry(id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(result);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    merge_session_meta(slot.get_mut(), result);
+                }
+            }
+        }
+    }
+    for (id, rounds) in snippet_rounds {
+        if let Some(session) = merged.get_mut(&id) {
+            session.snippets = interleave_snippets(rounds, MAX_SNIPPETS_PER_SESSION);
+        }
     }
 
-    let groups = group_hits_by_file(hits);
-    let catalog = load_catalog_render(index_dir)?;
-    let by_session = build_session_results(
-        groups,
-        &opts.query,
-        opts.context_chars,
-        opts.fuzzy,
-        catalog.as_ref(),
-    );
-
-    let mut sessions: Vec<SessionResult> = by_session.into_values().collect();
+    let mut sessions: Vec<SessionResult> = merged.into_values().collect();
     sessions.sort_by_key(|s| std::cmp::Reverse(s.last_msg_ms));
     Ok(sessions)
+}
+
+/// Fold `add` (the same session matched via another query string) into `into`.
+/// Snippets are handled separately in `interleave_snippets`.
+fn merge_session_meta(into: &mut SessionResult, add: SessionResult) {
+    into.sources.extend(add.sources);
+    into.files.extend(add.files);
+    into.last_msg_ms = into.last_msg_ms.max(add.last_msg_ms);
+    into.archived |= add.archived;
+    if into.title.is_none() {
+        into.title = add.title;
+    }
+    if into.project == "?" && add.project != "?" {
+        into.project = add.project;
+    }
+    match (into.display_stats.as_mut(), add.display_stats) {
+        (Some(a), Some(b)) => {
+            a.prompts = a.prompts.max(b.prompts);
+            a.tools = a.tools.max(b.tools);
+            a.bytes = a.bytes.max(b.bytes);
+        }
+        (None, Some(b)) => into.display_stats = Some(b),
+        _ => {}
+    }
+}
+
+/// Round-robin over per-query snippet lists so every query string stays
+/// represented within the per-session cap; drops cross-list duplicates (one
+/// line can match several strings).
+fn interleave_snippets(rounds: Vec<Vec<Snippet>>, cap: usize) -> Vec<Snippet> {
+    let mut out: Vec<Snippet> = Vec::new();
+    let longest = rounds.iter().map(|r| r.len()).max().unwrap_or(0);
+    'fill: for i in 0..longest {
+        for round in &rounds {
+            let Some(s) = round.get(i) else {
+                continue;
+            };
+            if out.iter().any(|existing| existing.text == s.text) {
+                continue;
+            }
+            out.push(s.clone());
+            if out.len() >= cap {
+                break 'fill;
+            }
+        }
+    }
+    out
 }
 
 fn candidate_limit(user_limit: usize) -> usize {
@@ -211,8 +316,6 @@ fn build_session_results(
     fuzzy: bool,
     catalog: Option<&CatalogRender>,
 ) -> BTreeMap<String, SessionResult> {
-    const MAX_SNIPPETS_PER_SESSION: usize = 10;
-
     // Phase 1 — generate snippets per file in parallel. Each `(path, hits)`
     // entry is independent: it does its own disk read + JSON parse + scan.
     // With many matched files this is the dominant cost; the merge in phase 2
@@ -911,28 +1014,35 @@ pub fn select_visible_snippets(snippets: &[Snippet], verbose: bool) -> Vec<&Snip
 }
 
 /// Print snippets respecting the three-tier fallback used by the Go tool.
-pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool, fuzzy: bool) {
+pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, fuzzy: bool) {
     use crate::term::highlight_any;
     let show = select_visible_snippets(snippets, verbose);
-    let token_strings: Vec<String> = if fuzzy {
-        query
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|t| t.chars().count() >= 2)
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        // Mirror the needle-expansion in `snippets_for_hits`: when "/research"
-        // matches lines via the bare "research" token, highlight that too.
-        let tokens: Vec<&str> = query
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|t| t.chars().count() >= 2)
-            .collect();
-        if tokens.len() == 1 && tokens[0] != query {
-            vec![query.to_string(), tokens[0].to_string()]
+    let mut token_strings: Vec<String> = Vec::new();
+    for query in queries {
+        if fuzzy {
+            token_strings.extend(
+                query
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|t| t.chars().count() >= 2)
+                    .map(|s| s.to_string()),
+            );
         } else {
-            Vec::new()
+            // Mirror the needle-expansion in `snippets_for_hits`: when
+            // "/research" matches lines via the bare "research" token,
+            // highlight that too.
+            let tokens: Vec<&str> = query
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|t| t.chars().count() >= 2)
+                .collect();
+            if queries.len() > 1 || (tokens.len() == 1 && tokens[0] != query) {
+                token_strings.push(query.to_string());
+            }
+            if tokens.len() == 1 && tokens[0] != query {
+                token_strings.push(tokens[0].to_string());
+            }
         }
-    };
+    }
+    let single_query = queries.first().map(String::as_str).unwrap_or("");
     let token_refs: Vec<&str> = token_strings.iter().map(|s| s.as_str()).collect();
 
     for (j, s) in show.iter().enumerate() {
@@ -953,7 +1063,7 @@ pub fn print_snippets(snippets: &[Snippet], query: &str, verbose: bool, fuzzy: b
         let highlighted = if !token_refs.is_empty() {
             highlight_any(&s.text, &token_refs)
         } else {
-            highlight(&s.text, query)
+            highlight(&s.text, single_query)
         };
         let highlighted = dim_ellipses(&highlighted);
         if !s.tag.is_empty() {

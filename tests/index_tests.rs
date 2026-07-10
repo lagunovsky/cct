@@ -95,8 +95,20 @@ impl Fixture {
 
     fn search(&self, query: &str, mode: SearchMode) -> Vec<SessionResult> {
         let opts = SearchOptions {
-            query: query.to_string(),
+            queries: vec![query.to_string()],
             mode,
+            limit: 20,
+            context_chars: 80,
+            project_prefix: None,
+            fuzzy: false,
+        };
+        run_search(&self.index_dir, &opts).unwrap_or_default()
+    }
+
+    fn search_multi(&self, queries: &[&str]) -> Vec<SessionResult> {
+        let opts = SearchOptions {
+            queries: queries.iter().map(|q| q.to_string()).collect(),
+            mode: SearchMode::Auto,
             limit: 20,
             context_chars: 80,
             project_prefix: None,
@@ -107,7 +119,7 @@ impl Fixture {
 
     fn search_fuzzy(&self, query: &str) -> Vec<SessionResult> {
         let opts = SearchOptions {
-            query: query.to_string(),
+            queries: vec![query.to_string()],
             mode: SearchMode::Auto,
             limit: 20,
             context_chars: 80,
@@ -652,7 +664,7 @@ fn short_pathish_query_still_searches_word_index() -> Result<()> {
     // "c/" enables the Path subindex in auto mode but is too short for the
     // ngram tokenizer; the word index must still be searched.
     let opts = SearchOptions {
-        query: "c/".to_string(),
+        queries: vec!["c/".to_string()],
         mode: SearchMode::Auto,
         limit: 20,
         context_chars: 80,
@@ -876,7 +888,7 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
     assert!(word_index.schema().get_field("project_id").is_ok());
 
     let opts = SearchOptions {
-        query: "boundaryterm".to_string(),
+        queries: vec!["boundaryterm".to_string()],
         mode: SearchMode::Auto,
         limit: 20,
         context_chars: 80,
@@ -906,7 +918,7 @@ fn search_reports_incompatible_catalog() -> Result<()> {
     )?;
 
     let opts = SearchOptions {
-        query: "catalogschema".to_string(),
+        queries: vec!["catalogschema".to_string()],
         mode: SearchMode::Auto,
         limit: 20,
         context_chars: 80,
@@ -1071,5 +1083,101 @@ fn full_reindex_includes_archived_sessions() -> Result<()> {
         &fx.search("distinctivezebraword", SearchMode::Auto),
         "zebra-session",
     );
+    Ok(())
+}
+
+#[test]
+fn multi_string_search_ands_at_session_level() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Both needles live in one session but on far-apart lines (separate
+    // prompts), so the AND must hold at session level, not line level.
+    fx.write_session(
+        "session-both",
+        &format!(
+            "{}\n{}\n{}\n",
+            jsonl_user("we discussed alphaneedle here"),
+            jsonl_assistant("unrelated middle content"),
+            jsonl_user("and betaneedle much later"),
+        ),
+    );
+    fx.write_session(
+        "session-alpha-only",
+        &format!("{}\n", jsonl_user("only alphaneedle in this one")),
+    );
+    fx.write_session(
+        "session-beta-only",
+        &format!("{}\n", jsonl_user("only betaneedle in this one")),
+    );
+    fx.full_reindex()?;
+
+    // Single strings still find their sessions.
+    assert_session(&fx.search("alphaneedle", SearchMode::Auto), "session-both");
+    assert_session(
+        &fx.search("alphaneedle", SearchMode::Auto),
+        "session-alpha-only",
+    );
+
+    // AND keeps only the session containing every string.
+    let results = fx.search_multi(&["alphaneedle", "betaneedle"]);
+    assert_eq!(
+        results.len(),
+        1,
+        "only session-both matches all strings: {:?}",
+        results.iter().map(|r| &r.session_id).collect::<Vec<_>>()
+    );
+    assert_eq!(results[0].session_id, "session-both");
+    // Snippets represent both strings.
+    assert!(
+        results[0]
+            .snippets
+            .iter()
+            .any(|s| s.text.contains("alphaneedle")),
+        "snippets must cover the first string: {:?}",
+        results[0].snippets
+    );
+    assert!(
+        results[0]
+            .snippets
+            .iter()
+            .any(|s| s.text.contains("betaneedle")),
+        "snippets must cover the second string: {:?}",
+        results[0].snippets
+    );
+
+    // No session has all three strings.
+    assert!(fx
+        .search_multi(&["alphaneedle", "betaneedle", "gammaneedle"])
+        .is_empty());
+    Ok(())
+}
+
+#[test]
+fn multi_string_search_matches_across_session_files() -> Result<()> {
+    let fx = Fixture::new()?;
+    // One string in the main jsonl, the other only in a tool-result sidecar:
+    // the session-level AND must still see them as one session.
+    fx.write_session(
+        "session-spread",
+        &format!("{}\n", jsonl_user("main log mentions firstprobe")),
+    );
+    fx.write_tool_result(
+        "session-spread",
+        "grep-output.txt",
+        "tool output line with secondprobe inside\n",
+    );
+    fx.write_session(
+        "session-decoy",
+        &format!("{}\n", jsonl_user("decoy also mentions firstprobe")),
+    );
+    fx.full_reindex()?;
+
+    let results = fx.search_multi(&["firstprobe", "secondprobe"]);
+    assert_eq!(
+        results.len(),
+        1,
+        "decoy lacks secondprobe: {:?}",
+        results.iter().map(|r| &r.session_id).collect::<Vec<_>>()
+    );
+    assert_eq!(results[0].session_id, "session-spread");
     Ok(())
 }

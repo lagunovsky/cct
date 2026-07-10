@@ -324,10 +324,25 @@ pub fn run_silent_update(index_dir: &Path, config: WriterConfig) -> Result<()> {
 }
 
 pub fn run_search(args: cli::SearchCmd) -> Result<()> {
-    let query = args.query.join(" ");
-    if query.trim().is_empty() {
+    // Each argument is one query string; a session must match all of them.
+    let queries: Vec<String> = args
+        .query
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if queries.is_empty() {
         bail!("empty query");
     }
+    let query_label = if queries.len() == 1 {
+        queries[0].clone()
+    } else {
+        queries
+            .iter()
+            .map(|q| format!("\"{q}\""))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
 
     let index_dir = index_root()?;
     let source = projects_dir()?;
@@ -337,7 +352,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     let project_label = resolved.as_ref().map(|r| r.label.clone());
 
     let start = Instant::now();
-    print_search_header(&query, &args, project_label.as_deref());
+    print_search_header(&query_label, &args, project_label.as_deref());
 
     let verbose_index = args.verbose >= 2;
     let mut scan_elapsed = Duration::ZERO;
@@ -407,7 +422,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         cli::SearchMode::Path => search::SearchMode::Only(IndexKind::Path),
     };
     let opts = SearchOptions {
-        query: query.clone(),
+        queries: queries.clone(),
         mode,
         limit: args.limit,
         context_chars: args.context,
@@ -437,7 +452,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         let stats_per_session = compute_session_stats_parallel(&visible);
         for (s, stats) in sessions.iter_mut().take(to_show).zip(stats_per_session) {
             search::print_session_header(s, stats.prompts, stats.tools, stats.bytes);
-            search::print_snippets(&s.snippets, &query, args.verbose >= 1, args.fuzzy);
+            search::print_snippets(&s.snippets, &queries, args.verbose >= 1, args.fuzzy);
             if args.verbose >= 1 {
                 for f in &s.files {
                     println!("  {DIM}{}{RESET}", f.display());
