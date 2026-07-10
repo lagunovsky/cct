@@ -101,9 +101,10 @@ per string. Within a single string, tokens must co-occur in nearby context.
 
 `--json` switches to machine-readable output for agents and scripts: one JSON
 object per session on stdout (id, title, project, archived, timestamps,
-prompt/tool/byte stats, matched files, snippets with tags), no colors or
-progress text. All snippets are included regardless of `-v`; progress and
-warnings go to stderr.
+prompt/tool/byte stats, snippets with tags), no colors or progress text;
+progress and warnings go to stderr. Content matches the human output — `-v`
+widens snippets to agent/hook matches and adds matched file paths, so shallow
+searches stay cheap by default.
 
 Multi-word queries are AND-ed and matched as a phrase on one line by default.
 Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets

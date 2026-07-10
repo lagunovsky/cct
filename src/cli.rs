@@ -152,7 +152,8 @@ pub struct SearchCmd {
     pub fuzzy: bool,
 
     /// Machine-readable output: one JSON object per session on stdout, no
-    /// colors or progress text. All snippets are included regardless of -v.
+    /// colors or progress text. Same content as the human output: -v adds
+    /// agent/hook snippets and matched file paths.
     #[arg(long = "json", default_value_t = false)]
     pub json: bool,
 

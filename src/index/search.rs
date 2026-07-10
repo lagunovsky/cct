@@ -66,6 +66,8 @@ pub struct DisplayStats {
 }
 
 const MAX_SNIPPETS_PER_SESSION: usize = 10;
+/// Display cap: how many of a session's snippets the renderers show.
+const MAX_SNIPPETS_SHOWN: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct Snippet {
@@ -1000,13 +1002,23 @@ pub fn print_session_header(s: &SessionResult, prompts: u32, tools: u32, bytes: 
     );
 }
 
-/// One session as a machine-readable JSON value for `--json` output. Snippet
-/// text is raw (no ANSI highlighting); `last_activity` duplicates
-/// `last_msg_ms` as RFC 3339 local time for readability.
-pub fn session_json(s: &SessionResult, prompts: u32, tools: u32, bytes: u64) -> serde_json::Value {
+/// One session as a machine-readable JSON value for `--json` output. Mirrors
+/// the human renderer's content selection so the flag only changes the format:
+/// the same snippet tiers and display cap apply, and `-v` adds agent/hook
+/// snippets plus matched file paths. Snippet text is raw (no ANSI
+/// highlighting); `last_activity` duplicates `last_msg_ms` as RFC 3339 local
+/// time for readability.
+pub fn session_json(
+    s: &SessionResult,
+    prompts: u32,
+    tools: u32,
+    bytes: u64,
+    verbose: bool,
+) -> serde_json::Value {
     let last_activity = chrono::DateTime::from_timestamp_millis(s.last_msg_ms)
         .map(|d| d.with_timezone(&chrono::Local).to_rfc3339());
-    serde_json::json!({
+    let snippets = select_visible_snippets(&s.snippets, verbose);
+    let mut value = serde_json::json!({
         "session_id": s.session_id,
         "title": s.title,
         "project": s.project,
@@ -1016,13 +1028,20 @@ pub fn session_json(s: &SessionResult, prompts: u32, tools: u32, bytes: u64) -> 
         "prompts": prompts,
         "tools": tools,
         "bytes": bytes,
-        "files": s.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-        "snippets": s.snippets.iter().map(|sn| serde_json::json!({
+        "snippets": snippets.iter().take(MAX_SNIPPETS_SHOWN).map(|sn| serde_json::json!({
             "tag": sn.tag,
             "time_ms": sn.time_ms,
             "text": sn.text,
         })).collect::<Vec<_>>(),
-    })
+    });
+    if verbose {
+        value["files"] = serde_json::json!(s
+            .files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>());
+    }
+    value
 }
 
 /// Three-tier fallback used by the Go tool: prompts/answers first, then any
@@ -1086,7 +1105,7 @@ pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, f
     let token_refs: Vec<&str> = token_strings.iter().map(|s| s.as_str()).collect();
 
     for (j, s) in show.iter().enumerate() {
-        if j >= 5 {
+        if j >= MAX_SNIPPETS_SHOWN {
             break;
         }
         let ts = if s.time_ms > 0 {
@@ -1130,36 +1149,65 @@ mod tests {
         assert_eq!(snippet, "Searching for: dnscrypt (global)");
     }
 
-    #[test]
-    fn session_json_is_flat_and_ansi_free() {
-        let s = SessionResult {
+    fn sample_session() -> SessionResult {
+        SessionResult {
             session_id: "abc-123".to_string(),
             project: "~/Work/x".to_string(),
             sources: BTreeSet::from(["session".to_string()]),
             files: BTreeSet::from([PathBuf::from("/p/-x/abc-123.jsonl")]),
-            snippets: vec![Snippet {
-                tag: "prompt".to_string(),
-                text: "fix the auth ⋯ timeout".to_string(),
-                time_ms: 1_700_000_000_000,
-            }],
+            snippets: vec![
+                Snippet {
+                    tag: "prompt".to_string(),
+                    text: "fix the auth ⋯ timeout".to_string(),
+                    time_ms: 1_700_000_000_000,
+                },
+                Snippet {
+                    tag: "agent".to_string(),
+                    text: "subagent found it".to_string(),
+                    time_ms: 1_700_000_000_000,
+                },
+            ],
             last_msg_ms: 1_700_000_000_000,
             display_stats: None,
             title: Some("my-session".to_string()),
             archived: true,
-        };
-        let v = session_json(&s, 12, 34, 5678);
+        }
+    }
+
+    #[test]
+    fn session_json_is_flat_and_ansi_free() {
+        let v = session_json(&sample_session(), 12, 34, 5678, false);
         assert_eq!(v["session_id"], "abc-123");
         assert_eq!(v["title"], "my-session");
         assert_eq!(v["archived"], true);
         assert_eq!(v["prompts"], 12);
         assert_eq!(v["tools"], 34);
         assert_eq!(v["bytes"], 5678);
-        assert_eq!(v["files"][0], "/p/-x/abc-123.jsonl");
         assert_eq!(v["snippets"][0]["tag"], "prompt");
         assert_eq!(v["snippets"][0]["text"], "fix the auth ⋯ timeout");
         assert!(v["last_activity"].as_str().unwrap().starts_with("2023-11-14"));
         let line = v.to_string();
         assert!(!line.contains('\u{1b}'), "no ANSI escapes in JSON output");
         assert!(!line.contains('\n'), "one line per session");
+    }
+
+    #[test]
+    fn session_json_respects_verbose_tiers() {
+        // Without -v: prompt tier only, no files — same economy as the
+        // human renderer.
+        let v = session_json(&sample_session(), 1, 2, 3, false);
+        assert_eq!(v["snippets"].as_array().unwrap().len(), 1);
+        assert!(v.get("files").is_none());
+
+        // With -v: agent/hook snippets and file paths appear.
+        let v = session_json(&sample_session(), 1, 2, 3, true);
+        let tags: Vec<&str> = v["snippets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["tag"].as_str().unwrap())
+            .collect();
+        assert_eq!(tags, ["prompt", "agent"]);
+        assert_eq!(v["files"][0], "/p/-x/abc-123.jsonl");
     }
 }

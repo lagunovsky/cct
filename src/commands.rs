@@ -438,13 +438,24 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
 
     let render_start = Instant::now();
     if args.json {
-        // Machine mode: raw snippets (no tier filter — agents want agent/hook
-        // matches too), one JSON object per session, nothing else on stdout.
+        // Machine mode: one JSON object per session, nothing else on stdout.
+        // Content selection matches the human renderer — -v widens snippets
+        // to agent/hook matches and adds file paths — so agents opt into
+        // depth instead of paying tokens for it on every search.
+        sessions.retain(|s| {
+            !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty()
+        });
         let to_show = sessions.len().min(args.limit);
         let visible: Vec<&search::SessionResult> = sessions.iter().take(to_show).collect();
         let stats_per_session = compute_session_stats_parallel(&visible);
         for (s, stats) in visible.iter().zip(stats_per_session) {
-            let value = search::session_json(s, stats.prompts, stats.tools, stats.bytes);
+            let value = search::session_json(
+                s,
+                stats.prompts,
+                stats.tools,
+                stats.bytes,
+                args.verbose >= 1,
+            );
             println!("{value}");
         }
         // Same post-search index hygiene as the human path, quiet on success.
