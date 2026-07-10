@@ -352,7 +352,9 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     let project_label = resolved.as_ref().map(|r| r.label.clone());
 
     let start = Instant::now();
-    print_search_header(&query_label, &args, project_label.as_deref());
+    if !args.json {
+        print_search_header(&query_label, &args, project_label.as_deref());
+    }
 
     let verbose_index = args.verbose >= 2;
     let mut scan_elapsed = Duration::ZERO;
@@ -435,6 +437,24 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     sp.stop();
 
     let render_start = Instant::now();
+    if args.json {
+        // Machine mode: raw snippets (no tier filter — agents want agent/hook
+        // matches too), one JSON object per session, nothing else on stdout.
+        let to_show = sessions.len().min(args.limit);
+        let visible: Vec<&search::SessionResult> = sessions.iter().take(to_show).collect();
+        let stats_per_session = compute_session_stats_parallel(&visible);
+        for (s, stats) in visible.iter().zip(stats_per_session) {
+            let value = search::session_json(s, stats.prompts, stats.tools, stats.bytes);
+            println!("{value}");
+        }
+        // Same post-search index hygiene as the human path, quiet on success.
+        if let Err(err) =
+            lock_index_exclusive(&index_dir).and_then(|_lock| optimize_delta(&index_dir, WriterConfig::for_delta_update()))
+        {
+            eprintln!("delta optimize skipped: {err:#}");
+        }
+        return Ok(());
+    }
     sessions
         .retain(|s| !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty());
     let total = sessions.len();

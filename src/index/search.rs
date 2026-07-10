@@ -985,6 +985,31 @@ pub fn print_session_header(s: &SessionResult, prompts: u32, tools: u32, bytes: 
     );
 }
 
+/// One session as a machine-readable JSON value for `--json` output. Snippet
+/// text is raw (no ANSI highlighting); `last_activity` duplicates
+/// `last_msg_ms` as RFC 3339 local time for readability.
+pub fn session_json(s: &SessionResult, prompts: u32, tools: u32, bytes: u64) -> serde_json::Value {
+    let last_activity = chrono::DateTime::from_timestamp_millis(s.last_msg_ms)
+        .map(|d| d.with_timezone(&chrono::Local).to_rfc3339());
+    serde_json::json!({
+        "session_id": s.session_id,
+        "title": s.title,
+        "project": s.project,
+        "archived": s.archived,
+        "last_msg_ms": s.last_msg_ms,
+        "last_activity": last_activity,
+        "prompts": prompts,
+        "tools": tools,
+        "bytes": bytes,
+        "files": s.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "snippets": s.snippets.iter().map(|sn| serde_json::json!({
+            "tag": sn.tag,
+            "time_ms": sn.time_ms,
+            "text": sn.text,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// Three-tier fallback used by the Go tool: prompts/answers first, then any
 /// "other" tagged snippets, finally agent/hook (only when verbose).
 pub fn select_visible_snippets(snippets: &[Snippet], verbose: bool) -> Vec<&Snippet> {
@@ -1075,5 +1100,43 @@ pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, f
         } else {
             println!("  {DIM}{ts}{RESET}{text}", text = highlighted);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_json_is_flat_and_ansi_free() {
+        let s = SessionResult {
+            session_id: "abc-123".to_string(),
+            project: "~/Work/x".to_string(),
+            sources: BTreeSet::from(["session".to_string()]),
+            files: BTreeSet::from([PathBuf::from("/p/-x/abc-123.jsonl")]),
+            snippets: vec![Snippet {
+                tag: "prompt".to_string(),
+                text: "fix the auth ⋯ timeout".to_string(),
+                time_ms: 1_700_000_000_000,
+            }],
+            last_msg_ms: 1_700_000_000_000,
+            display_stats: None,
+            title: Some("my-session".to_string()),
+            archived: true,
+        };
+        let v = session_json(&s, 12, 34, 5678);
+        assert_eq!(v["session_id"], "abc-123");
+        assert_eq!(v["title"], "my-session");
+        assert_eq!(v["archived"], true);
+        assert_eq!(v["prompts"], 12);
+        assert_eq!(v["tools"], 34);
+        assert_eq!(v["bytes"], 5678);
+        assert_eq!(v["files"][0], "/p/-x/abc-123.jsonl");
+        assert_eq!(v["snippets"][0]["tag"], "prompt");
+        assert_eq!(v["snippets"][0]["text"], "fix the auth ⋯ timeout");
+        assert!(v["last_activity"].as_str().unwrap().starts_with("2023-11-14"));
+        let line = v.to_string();
+        assert!(!line.contains('\u{1b}'), "no ANSI escapes in JSON output");
+        assert!(!line.contains('\n'), "one line per session");
     }
 }

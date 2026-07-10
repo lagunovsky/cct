@@ -147,6 +147,11 @@ pub struct SearchCmd {
     #[arg(short = 'f', long = "fuzzy", default_value_t = false)]
     pub fuzzy: bool,
 
+    /// Machine-readable output: one JSON object per session on stdout, no
+    /// colors or progress text. All snippets are included regardless of -v.
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
+
     /// Search backend selection.
     #[arg(long = "mode", value_enum, default_value_t = SearchMode::Auto)]
     pub mode: SearchMode,

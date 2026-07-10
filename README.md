@@ -99,6 +99,12 @@ match anywhere in the session (main log, subagent log, or tool result), and
 only sessions containing all of them are returned. Index selection above is
 per string. Within a single string, tokens must co-occur in nearby context.
 
+`--json` switches to machine-readable output for agents and scripts: one JSON
+object per session on stdout (id, title, project, archived, timestamps,
+prompt/tool/byte stats, matched files, snippets with tags), no colors or
+progress text. All snippets are included regardless of `-v`; progress and
+warnings go to stderr.
+
 Multi-word queries are AND-ed and matched as a phrase on one line by default.
 Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets
 even when the full phrase never appears on a single line.
@@ -188,7 +194,7 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 
 | Command | Description |
 |---------|-------------|
-| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--mode`, `--no-update` |
+| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--json`, `--mode`, `--no-update` |
 | `cct recent` | Recent sessions in cwd; flag: `-n` |
 | `cct reindex` | Rebuild the Tantivy index from scratch |
 | `cct update` | Incremental update (auto on each search; manual when scripted) |
