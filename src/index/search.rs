@@ -784,7 +784,22 @@ fn snippet_window(text: &str, match_idx: usize, match_len: usize, context_chars:
 
     let mut sanitized = String::with_capacity(snippet.len());
     let mut prev_space = false;
-    for ch in snippet.chars() {
+    let mut chars = snippet.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // Session logs quote terminal output, so snippets can contain real
+        // ANSI CSI sequences (stored as […). Swallow them whole: mapping
+        // just the ESC to a space would leave the tail ("[1m", "[0m") behind
+        // as visible garbage. A sequence cut off by the window start still
+        // leaks its tail — rare enough to live with.
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+            continue;
+        }
         if (ch as u32) < 32 || ch == '{' || ch == '}' {
             if !prev_space {
                 sanitized.push(' ');
@@ -1106,6 +1121,14 @@ pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippet_window_swallows_csi_sequences_whole() {
+        let text = "\u{1b}[1mSearching for:\u{1b}[0m dnscrypt \u{1b}[2m(global)\u{1b}[0m";
+        let idx = text.find("dnscrypt").unwrap();
+        let snippet = snippet_window(text, idx, "dnscrypt".len(), 120);
+        assert_eq!(snippet, "Searching for: dnscrypt (global)");
+    }
 
     #[test]
     fn session_json_is_flat_and_ansi_free() {

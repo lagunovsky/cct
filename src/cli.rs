@@ -44,10 +44,12 @@ pub const KNOWN_SUBCOMMANDS: &[&str] = &[
     "help",
 ];
 
-/// Treat a bare first argument that is neither a flag nor a known subcommand as
-/// an implicit `search` query, so `cct ветка` behaves like `cct search ветка`.
-/// `args` is the full argv (program name included); returns it unchanged in
-/// every other case.
+/// Treat a first argument that is not a known subcommand as an implicit
+/// `search` invocation: `cct ветка` behaves like `cct search ветка`, and —
+/// since top-level `cct` has no flags of its own besides help/version —
+/// `cct --json ветка` or `cct -g ветка` become flag-first searches too.
+/// `args` is the full argv (program name included); returns it unchanged for
+/// known subcommands, help/version, and the no-argument case.
 pub fn normalize_args<I, S>(args: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -57,7 +59,9 @@ where
     let Some(first) = args.get(1) else {
         return args;
     };
-    if first.starts_with('-') || KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
+    if KNOWN_SUBCOMMANDS.contains(&first.as_str())
+        || matches!(first.as_str(), "-h" | "--help" | "-V" | "--version")
+    {
         return args;
     }
     args.insert(1, "search".to_string());
@@ -360,9 +364,24 @@ mod tests {
         for cmd in ["search", "s", "reindex", "ri", "transfer", "tr", "daemon", "help"] {
             assert_eq!(norm(&["cct", cmd]), vec!["cct", cmd]);
         }
-        // Flags and the no-argument case are never rewritten.
+        // Help/version and the no-argument case are never rewritten.
         assert_eq!(norm(&["cct", "-h"]), vec!["cct", "-h"]);
+        assert_eq!(norm(&["cct", "--help"]), vec!["cct", "--help"]);
+        assert_eq!(norm(&["cct", "-V"]), vec!["cct", "-V"]);
+        assert_eq!(norm(&["cct", "--version"]), vec!["cct", "--version"]);
         assert_eq!(norm(&["cct"]), vec!["cct"]);
+    }
+
+    #[test]
+    fn flag_first_invocation_becomes_implicit_search() {
+        assert_eq!(
+            norm(&["cct", "--json", "ветка"]),
+            vec!["cct", "search", "--json", "ветка"]
+        );
+        assert_eq!(
+            norm(&["cct", "-g", "hook", "PreToolUse"]),
+            vec!["cct", "search", "-g", "hook", "PreToolUse"]
+        );
     }
 
     #[test]
