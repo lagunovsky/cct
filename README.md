@@ -298,13 +298,22 @@ the relocated files.
 `cct transfer` moves individual sessions from one project into another:
 
 ```sh
+cct transfer abc123 ../other              # by full id or unique prefix, from any project
+cct transfer abc123 def456 ../other       # several; the target always comes last
+cct transfer abc123,def456 ../other       # comma-separated also accepted
+cct transfer my-session ../other          # by /rename title
+cct transfer --from /old/proj dev ../other  # a title several projects share
 cct transfer ../other                     # interactive: pick sessions from cwd
-cct transfer ../other abc123 def456       # by full id or unique prefix
-cct transfer ../other abc123,def456       # comma-separated also accepted
-cct transfer --from /old/proj ../other abc  # source other than cwd
-cct transfer --dry-run ../other abc123    # preview
-cct transfer -y ../other abc123           # skip confirmation prompt
+cct transfer --dry-run abc123 ../other    # preview
+cct transfer -y abc123 ../other           # skip confirmation prompt
 ```
+
+An id names one session wherever it lives, so no source project is needed:
+the session is found under `~/.claude/projects`, and the project path that gets
+rewritten to the target comes from its own `cwd` records. A title is looked up
+in the current project first, then in every project through the index catalog;
+when several projects have a session by that name, the error lists them and
+`--from` picks one.
 
 Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 `/` to filter, and Enter to confirm.
@@ -320,7 +329,7 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 | `cct update` | Incremental update (auto on each search; manual when scripted) |
 | `cct compact` | Merge Tantivy segments to `--target-segments` (default 1) |
 | `cct rename [old] <new>` | Move project dir + migrate sessions + rewrite `cwd`; flags: `--no-move-dir`, `--dry-run` |
-| `cct transfer <target> [ids...]` | Transfer specific sessions between projects; flags: `--from`, `-y`, `--dry-run` |
+| `cct transfer <session>... <target>` | Transfer specific sessions between projects; flags: `--from`, `-y`, `--dry-run` |
 | `cct daemon install` | Install launchd job for background indexing every 30 min on AC power |
 | `cct daemon uninstall` | Remove launchd job |
 | `cct daemon update` | Background update entry point used by launchd |

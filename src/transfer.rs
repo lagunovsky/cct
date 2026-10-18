@@ -1,12 +1,16 @@
 //! `cct transfer` — transfer specific sessions between projects.
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::index::catalog::read_catalog;
 use crate::path_codec::{
-    absolutize_lexical, clean_path_lexical, encode_project_dir, projects_dir, short_project,
+    absolutize_lexical, clean_path_lexical, encode_project_dir, index_root, projects_dir,
+    short_project,
 };
 use crate::picker::{confirm, run_multi_picker, PickerItem};
 use crate::recent::{first_user_prompt, session_activity_time_ms, session_title};
@@ -14,49 +18,262 @@ use crate::rename::{count_overlapping, replace_in_file};
 use crate::term::{fmt_size, BOLD, CYAN, DIM, GREEN, RED, RESET};
 
 pub struct TransferArgs {
-    pub target: String,
     pub from: Option<String>,
-    pub session_args: Vec<String>,
+    /// Sessions, then the target project last.
+    pub args: Vec<String>,
     pub dry_run: bool,
     pub skip_confirm: bool,
 }
 
 pub fn run_transfer(args: TransferArgs) -> Result<()> {
-    let src_str = args.from.unwrap_or_else(|| ".".to_string());
-    let src_abs = absolutize_lexical(&src_str)?;
-    let dst_abs = absolutize_lexical(&args.target)?;
+    let (target, session_args) = args
+        .args
+        .split_last()
+        .ok_or_else(|| anyhow!("missing target project"))?;
+    let dst_abs = absolutize_lexical(target)?;
+    let from = args.from.as_deref().map(absolutize_lexical).transpose()?;
+    let projects = projects_dir()?;
 
     // Keep arguments whole here: a session title set via /rename may itself
     // contain commas. Comma-splitting happens during resolution, only when
     // the whole argument doesn't match anything.
-    let mut ids: Vec<String> = args
-        .session_args
+    let ids: Vec<String> = session_args
         .iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    let mut skip_confirm = args.skip_confirm;
     if ids.is_empty() {
+        // `cct transfer abc123` with the target forgotten would otherwise
+        // offer to move cwd's sessions into a new project named abc123.
+        if !dst_abs.exists() && find_by_id(&projects, target)?.is_some() {
+            bail!("{target:?} is a session, not a project — usage: cct transfer <session>... <target>");
+        }
+        let src_abs = match from {
+            Some(src) => src,
+            None => absolutize_lexical(".")?,
+        };
         let sessions = list_project_sessions(&src_abs)
             .with_context(|| format!("list sessions in {}", src_abs.display()))?;
-        ids = pick_sessions_interactive(&sessions, &src_abs)?;
-        skip_confirm = true;
+        let ids = pick_sessions_interactive(&sessions, &src_abs)?;
+        return transfer_sessions(&ids, &src_abs, &dst_abs, args.dry_run);
     }
 
-    if !args.dry_run && !skip_confirm {
-        let prompt = format!(
-            "Transfer {} session(s) to {}? [y/N]: ",
-            ids.len(),
-            dst_abs.display()
-        );
+    // With --from everything resolves inside that project, as titles may need.
+    let groups: BTreeMap<PathBuf, Vec<String>> = match from {
+        Some(src) => BTreeMap::from([(src, ids)]),
+        None => {
+            let cwd = absolutize_lexical(".")?;
+            let titled = |title: &str| catalog_paths_titled(title);
+            let mut groups: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+            for raw in &ids {
+                for found in locate_session_arg(&projects, Some(&cwd), raw, &titled)? {
+                    groups.entry(found.project).or_default().push(found.id);
+                }
+            }
+            groups
+        }
+    };
+
+    if !args.dry_run && !args.skip_confirm {
+        let total: usize = groups.values().map(Vec::len).sum();
+        for (src, ids) in &groups {
+            println!("  {DIM}from{RESET} {}: {}", short_project(&src.to_string_lossy()), ids.join(", "));
+        }
+        let prompt = format!("Transfer {total} session(s) to {}? [y/N]: ", dst_abs.display());
         if !confirm(&prompt) {
             println!("{DIM}aborted{RESET}");
             return Ok(());
         }
     }
 
-    transfer_sessions(&ids, &src_abs, &dst_abs, args.dry_run)
+    for (src_abs, ids) in &groups {
+        transfer_sessions_in(ids, src_abs, &dst_abs, args.dry_run, &projects)?;
+    }
+    Ok(())
+}
+
+/// A session an argument named: the project it belongs to and its id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedSession {
+    pub project: PathBuf,
+    pub id: String,
+}
+
+/// [`locate_session_in`] for one CLI argument: tried whole first (a title may
+/// contain commas), then as a comma-separated list.
+pub fn locate_session_arg(
+    projects: &Path,
+    scope: Option<&Path>,
+    raw: &str,
+    titled: &dyn Fn(&str) -> Vec<PathBuf>,
+) -> Result<Vec<LocatedSession>> {
+    match locate_session_in(projects, scope, raw, titled) {
+        Ok(found) => Ok(vec![found]),
+        Err(whole_err) => {
+            let parts: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+            if parts.len() < 2 {
+                return Err(whole_err);
+            }
+            parts
+                .into_iter()
+                .map(|part| locate_session_in(projects, scope, part, titled))
+                .collect()
+        }
+    }
+}
+
+/// Find the session `q` names without being told its project. An id or a
+/// unique id prefix is looked up in every project — it names one session
+/// wherever it lives. A `/rename` title is not unique: it is looked up in
+/// `scope` (cwd) first, then everywhere via `titled`, and a title shared by
+/// sessions in several projects is an error that asks for `--from`.
+pub fn locate_session_in(
+    projects: &Path,
+    scope: Option<&Path>,
+    q: &str,
+    titled: &dyn Fn(&str) -> Vec<PathBuf>,
+) -> Result<LocatedSession> {
+    if let Some(jsonl) = find_by_id(projects, q)? {
+        return located(&jsonl);
+    }
+    if let Some(scope) = scope {
+        let dir = projects.join(encode_project_dir(&scope.to_string_lossy()));
+        if dir.is_dir() {
+            if let Ok(id) = resolve_session_id(&dir, q) {
+                return Ok(LocatedSession {
+                    project: scope.to_path_buf(),
+                    id,
+                });
+            }
+        }
+    }
+    // The catalog may lag behind a later /rename; the file has the last word.
+    let mut by_title: Vec<PathBuf> = titled(q)
+        .into_iter()
+        .filter(|p| p.parent().and_then(Path::parent) == Some(projects))
+        .filter(|p| session_title(p).as_deref() == Some(q))
+        .collect();
+    by_title.sort();
+    by_title.dedup();
+    match by_title.len() {
+        0 => bail!("no session matches {q:?}"),
+        1 => located(&by_title[0]),
+        n => {
+            let mut msg = format!("title {q:?} is ambiguous ({n} sessions) — pass --from <project>:");
+            for p in &by_title {
+                let id = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let project = project_of(p)
+                    .map(|pr| short_project(&pr.to_string_lossy()))
+                    .unwrap_or_else(|_| "?".into());
+                msg.push_str(&format!("\n  {id}  {project}"));
+            }
+            bail!(msg)
+        }
+    }
+}
+
+fn located(jsonl: &Path) -> Result<LocatedSession> {
+    let id = jsonl
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(LocatedSession {
+        project: project_of(jsonl)?,
+        id,
+    })
+}
+
+/// The session file whose id is `q` or starts with it, in any project.
+/// `None` when nothing matches; an error when a prefix fits several.
+fn find_by_id(projects: &Path, q: &str) -> Result<Option<PathBuf>> {
+    // An id never holds a path separator; refusing them keeps `../x` from
+    // reaching outside the projects dir.
+    if q.is_empty() || q.contains(['/', '\\']) || q == "." || q == ".." {
+        return Ok(None);
+    }
+    let mut exact: Vec<PathBuf> = Vec::new();
+    let mut prefixed: Vec<PathBuf> = Vec::new();
+    for project in fs::read_dir(projects).with_context(|| format!("read dir {}", projects.display()))? {
+        let project = project?;
+        if !project.file_type()?.is_dir() {
+            continue;
+        }
+        let candidate = project.path().join(format!("{q}.jsonl"));
+        if candidate.is_file() {
+            exact.push(candidate);
+            continue;
+        }
+        for entry in fs::read_dir(project.path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(q) && name.ends_with(".jsonl") && entry.file_type()?.is_file() {
+                prefixed.push(entry.path());
+            }
+        }
+    }
+    let matches = if exact.is_empty() { prefixed } else { exact };
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        n => {
+            let mut msg = format!("id prefix {q:?} is ambiguous ({n} matches):");
+            for p in matches.iter().take(10) {
+                let id = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                msg.push_str(&format!("\n  {id}"));
+            }
+            bail!(msg)
+        }
+    }
+}
+
+/// The project a session file belongs to. Its directory name is a lossy
+/// encoding of the project path, so the path comes from the session's own
+/// `cwd` records: the first whose encoding is that directory name. (Later
+/// records may carry a subdirectory the agent moved into.)
+fn project_of(jsonl: &Path) -> Result<PathBuf> {
+    let dir_name = jsonl
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let file = fs::File::open(jsonl).with_context(|| format!("open {}", jsonl.display()))?;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|c| c.as_str()) {
+            if encode_project_dir(cwd) == dir_name {
+                return Ok(PathBuf::from(cwd));
+            }
+        }
+    }
+    bail!(
+        "cannot tell which project {} belongs to — pass --from <project>",
+        jsonl.display()
+    )
+}
+
+/// Session files the search index's catalog lists under `title`. Empty when
+/// there is no index: the title is then found only in cwd's project.
+fn catalog_paths_titled(title: &str) -> Vec<PathBuf> {
+    let Ok(index_dir) = index_root() else {
+        return Vec::new();
+    };
+    read_catalog(&index_dir)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|e| e.title.as_deref() == Some(title))
+                .map(|e| e.path)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -210,7 +427,10 @@ fn resolve_session_id(src_dir: &Path, q: &str) -> Result<String> {
             src_dir.display()
         )),
         1 => Ok(by_title.remove(0)),
-        n => Err(anyhow!("title {:?} is ambiguous ({n} matches)", q)),
+        n => Err(anyhow!(
+            "title {q:?} is ambiguous ({n} matches) — use an id:\n  {}",
+            by_title.join("\n  ")
+        )),
     }
 }
 

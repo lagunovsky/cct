@@ -304,9 +304,8 @@ pub fn run_rename(args: cli::RenameCmd) -> Result<()> {
 
 pub fn run_transfer(args: cli::TransferCmd) -> Result<()> {
     crate::transfer::run_transfer(crate::transfer::TransferArgs {
-        target: args.target,
         from: args.from,
-        session_args: args.session_ids,
+        args: args.args,
         dry_run: args.dry_run,
         skip_confirm: args.yes,
     })

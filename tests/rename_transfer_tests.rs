@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use cct::path_codec::encode_project_dir;
 use cct::rename::{rename_project_in, RenameArgs};
-use cct::transfer::transfer_sessions_in;
+use cct::transfer::{locate_session_arg, locate_session_in, transfer_sessions_in, LocatedSession};
 
 struct WorkspaceFixture {
     _tmp: tempfile::TempDir,
@@ -447,5 +447,81 @@ fn transfer_into_same_project_is_an_error() -> Result<()> {
         &fx.projects,
     );
     assert!(res.is_err(), "src == dst must fail");
+    Ok(())
+}
+
+fn no_titles(_: &str) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn add_title(fx: &WorkspaceFixture, project: &Path, id: &str, title: &str) -> PathBuf {
+    let file = fx.session_dir_for(project).join(format!("{id}.jsonl"));
+    let mut content = read_to_string(&file);
+    content.push_str(&format!(
+        r#"{{"type":"custom-title","customTitle":"{title}","sessionId":"{id}"}}"#
+    ));
+    content.push('\n');
+    fs::write(&file, content).unwrap();
+    file
+}
+
+#[test]
+fn locate_finds_an_id_in_any_project() -> Result<()> {
+    let fx = WorkspaceFixture::new()?;
+    let a = fx.make_project("loc-a", &[("aaaa1111", "x")])?;
+    let b = fx.make_project("loc-b", &[("bbbb2222", "y"), ("bbbb3333", "z")])?;
+
+    let found = locate_session_in(&fx.projects, None, "aaaa1111", &no_titles)?;
+    assert_eq!(found, LocatedSession { project: a, id: "aaaa1111".into() });
+    // The project path comes from the session's cwd, not from decoding the
+    // lossy directory name.
+    let found = locate_session_in(&fx.projects, None, "bbbb3", &no_titles)?;
+    assert_eq!(found, LocatedSession { project: b.clone(), id: "bbbb3333".into() });
+
+    let err = locate_session_in(&fx.projects, None, "bbbb", &no_titles).unwrap_err();
+    assert!(err.to_string().contains("ambiguous"), "{err}");
+    assert!(locate_session_in(&fx.projects, None, "../loc-b", &no_titles).is_err());
+
+    let both = locate_session_arg(&fx.projects, None, "aaaa1111,bbbb2222", &no_titles)?;
+    assert_eq!(both.len(), 2);
+    assert_eq!(both[1].project, b);
+    Ok(())
+}
+
+#[test]
+fn locate_finds_a_title_in_cwd_then_everywhere_and_asks_when_shared() -> Result<()> {
+    let fx = WorkspaceFixture::new()?;
+    let a = fx.make_project("title-a", &[("aaaa1111", "x")])?;
+    let b = fx.make_project("title-b", &[("bbbb2222", "y")])?;
+    let a_file = add_title(&fx, &a, "aaaa1111", "shared-name");
+    let b_file = add_title(&fx, &b, "bbbb2222", "shared-name");
+    add_title(&fx, &b, "bbbb2222", "only-in-b");
+
+    // cwd's project settles a title shared with other projects.
+    let found = locate_session_in(&fx.projects, Some(&a), "shared-name", &no_titles)?;
+    assert_eq!(found.id, "aaaa1111");
+
+    // Outside its project a title is looked up everywhere; the file's last
+    // rename wins over a stale catalog entry.
+    let catalog = |t: &str| -> Vec<PathBuf> {
+        match t {
+            "shared-name" => vec![a_file.clone(), b_file.clone()],
+            "only-in-b" => vec![b_file.clone()],
+            _ => Vec::new(),
+        }
+    };
+    let elsewhere = fx.work.join("elsewhere");
+    let found = locate_session_in(&fx.projects, Some(&elsewhere), "only-in-b", &catalog)?;
+    assert_eq!(found, LocatedSession { project: b, id: "bbbb2222".into() });
+    let found = locate_session_in(&fx.projects, Some(&elsewhere), "shared-name", &catalog)?;
+    assert_eq!(found.id, "aaaa1111", "b was renamed again, so only a still holds the name");
+
+    add_title(&fx, &a, "aaaa1111", "twice");
+    add_title(&fx, &fx.work.join("title-b"), "bbbb2222", "twice");
+    let twice = |t: &str| -> Vec<PathBuf> {
+        if t == "twice" { vec![a_file.clone(), b_file.clone()] } else { Vec::new() }
+    };
+    let err = locate_session_in(&fx.projects, Some(&elsewhere), "twice", &twice).unwrap_err();
+    assert!(err.to_string().contains("--from"), "{err}");
     Ok(())
 }

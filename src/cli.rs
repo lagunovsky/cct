@@ -101,7 +101,10 @@ pub enum Cmd {
     Rename(RenameCmd),
 
     /// Transfer specific sessions between projects.
-    #[command(visible_alias = "tr")]
+    #[command(
+        visible_alias = "tr",
+        override_usage = "cct transfer [OPTIONS] <SESSION>... <TARGET>\n       cct transfer [OPTIONS] <TARGET>"
+    )]
     Transfer(TransferCmd),
 
     /// Manage launchd background indexing (macOS).
@@ -281,7 +284,10 @@ pub struct RenameCmd {
 
 #[derive(Args, Debug)]
 pub struct TransferCmd {
-    /// Source project path. Defaults to cwd.
+    /// Source project path. Not needed for ids: a session is found wherever it
+    /// lives. Restricts lookup to this project, which settles a title shared
+    /// by sessions in several projects; with only `<target>`, the project the
+    /// picker lists (default: cwd).
     #[arg(long = "from")]
     pub from: Option<String>,
     #[arg(long = "dry-run", default_value_t = false)]
@@ -290,13 +296,11 @@ pub struct TransferCmd {
     #[arg(short = 'y', long = "yes", default_value_t = false)]
     pub yes: bool,
 
-    /// Target project path.
-    #[arg(required = true)]
-    pub target: String,
-
-    /// Optional session ids (UUIDs or unique prefixes). Without ids: interactive picker.
-    #[arg(num_args = 0..)]
-    pub session_ids: Vec<String>,
+    /// `<session>... <target>`: sessions (ids, unique id prefixes or `/rename`
+    /// titles) and the target project path, last. `<target>` alone: pick the
+    /// sessions interactively.
+    #[arg(num_args = 1.., required = true, value_name = "ARGS")]
+    pub args: Vec<String>,
 }
 
 #[derive(Args, Debug)]
