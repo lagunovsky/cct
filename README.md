@@ -29,6 +29,13 @@ todos, hook errors, plans. The exclusion list is `BOILERPLATE_ATTACHMENTS` in
 `src/text.rs`; snippets skip those lines too, so an index built before the
 change stops showing them even before `cct reindex`.
 
+Copies are left out as well: base64 (thinking signatures, images), per-record
+uuids and timestamps, `api-request*` and `file-history-snapshot` records,
+queued prompts that were later delivered, and `toolUseResult` strings the
+record's tool_result already holds. On a 19.7 GB corpus this took the index
+from 3.2 GB to 0.6 GB. Snippets come from the same fields, so a session is never
+found through text it cannot show. See `for_each_indexed_string`.
+
 ## Install
 
 ```sh

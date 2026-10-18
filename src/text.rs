@@ -24,7 +24,10 @@ pub fn extract_text(data: &[u8]) -> (String, SessionStats) {
                 if is_boilerplate_record(&value) {
                     continue;
                 }
-                collect_strings(&value, &mut buf);
+                for_each_indexed_string(&value, &mut |s| {
+                    buf.push_str(s);
+                    buf.push(' ');
+                });
                 if let JsonValue::Object(map) = &value {
                     count_stats(map, &mut stats);
                 }
@@ -89,10 +92,31 @@ const BOILERPLATE_ATTACHMENTS: &[&str] = &[
     "total_tokens_reminder",
 ];
 
-/// True for a record that repeats session-independent context. See
-/// [`BOILERPLATE_ATTACHMENTS`].
+/// Records that only copy what the transcript already holds. `api-request*`
+/// is the request as sent to the API: the system prompt, the tool schemas and
+/// the messages again. `file-history-snapshot` lists the files Edit/Write
+/// backed up — the same paths, repeated in every checkpoint. A queued prompt is
+/// written once when enqueued and again as the prompt when it is delivered;
+/// only one that was removed from the queue exists nowhere else.
+const DUPLICATE_RECORDS: &[&str] = &[
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
+    "file-history-snapshot",
+];
+
+/// True for a record that repeats session-independent context or another
+/// record of the same session. See [`BOILERPLATE_ATTACHMENTS`] and
+/// [`DUPLICATE_RECORDS`].
 pub fn is_boilerplate_record(value: &JsonValue) -> bool {
-    if value.get("type").and_then(|v| v.as_str()) != Some("attachment") {
+    let record = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if DUPLICATE_RECORDS.contains(&record) {
+        return true;
+    }
+    if record == "queue-operation" {
+        return value.get("operation").and_then(|v| v.as_str()) != Some("remove");
+    }
+    if record != "attachment" {
         return false;
     }
     let Some(attachment) = value.get("attachment") else {
@@ -154,9 +178,12 @@ pub fn edited_path(line: &str) -> Option<String> {
 }
 
 /// [`is_boilerplate_record`] for a raw JSONL line, cheap for every other line:
-/// only lines that mention an attachment are parsed.
+/// only lines that mention an attachment or a duplicate record are parsed.
 pub fn is_boilerplate_line(line: &str) -> bool {
-    if !line.contains("\"attachment\"") {
+    if !line.contains("\"attachment\"")
+        && !line.contains("\"queue-operation\"")
+        && !DUPLICATE_RECORDS.iter().any(|t| line.contains(&format!("\"{t}\"")))
+    {
         return false;
     }
     serde_json::from_str::<JsonValue>(line.trim())
@@ -174,24 +201,121 @@ fn trim_ws(mut data: &[u8]) -> &[u8] {
     data
 }
 
-fn collect_strings(value: &JsonValue, out: &mut String) {
-    match value {
-        JsonValue::String(s) if s.len() > 1 => {
-            out.push_str(s);
-            out.push(' ');
+/// Top-level fields that identify one record rather than say anything:
+/// a fresh uuid per line, so each is a term no query will ever ask for.
+/// `wireToolInputs` repeats the tool_use input; the classifier fields are git
+/// state and request ids.
+const RECORD_ID_KEYS: &[&str] = &[
+    "uuid",
+    "parentUuid",
+    "logicalParentUuid",
+    "requestId",
+    "promptId",
+    "sourceToolAssistantUUID",
+    "toolUseID",
+    "parentToolUseID",
+    "timestamp",
+    "wireToolInputs",
+    "serverClassifierContext",
+    "serverClassifierRequest",
+];
+
+/// toolUseResult strings shorter than this are kept without the duplicate
+/// check: they cost nothing, and a short one "contained" in the message may
+/// only be part of a longer word there.
+const MIN_DEDUP_LEN: usize = 64;
+
+/// Calls `f` with every string of a record worth indexing — the same set the
+/// snippet pass looks in, so a session is never found through text it cannot
+/// show. Left out:
+///
+/// - base64: thinking signatures, images, Read of an image (`file.base64`).
+///   A third of a sample's text, and no one searches for a blob's middle;
+/// - [`RECORD_ID_KEYS`] and the `msg_…`/`toolu_…` ids;
+/// - toolUseResult strings already present in the record's message: the
+///   tool_result there carries the same stdout or file content (with line
+///   numbers for Read). Only what the message lacks — a diff, an original
+///   file, output the message truncated — is kept.
+pub fn for_each_indexed_string<'a>(record: &'a JsonValue, f: &mut impl FnMut(&'a str)) {
+    let JsonValue::Object(map) = record else {
+        walk_strings(record, f);
+        return;
+    };
+    let mut message_text: Option<(String, Option<String>)> = None;
+    for (key, value) in map {
+        if RECORD_ID_KEYS.contains(&key.as_str()) {
+            continue;
         }
+        if key != "toolUseResult" || !map.contains_key("message") {
+            walk_strings(value, f);
+            continue;
+        }
+        walk_strings(value, &mut |s: &'a str| {
+            if s.len() < MIN_DEDUP_LEN {
+                return f(s);
+            }
+            let (plain, numbered) = message_text.get_or_insert_with(|| {
+                let mut text = String::new();
+                walk_strings(&map["message"], &mut |m| {
+                    text.push_str(m);
+                    text.push('\n');
+                });
+                (text, None)
+            });
+            if plain.contains(s) {
+                return;
+            }
+            let stripped = numbered.get_or_insert_with(|| strip_line_numbers(plain));
+            if !stripped.contains(s) {
+                f(s);
+            }
+        });
+    }
+}
+
+fn walk_strings<'a>(value: &'a JsonValue, f: &mut impl FnMut(&'a str)) {
+    match value {
+        JsonValue::String(s) if s.len() > 1 => f(s),
         JsonValue::Array(values) => {
             for v in values {
-                collect_strings(v, out);
+                walk_strings(v, f);
             }
         }
         JsonValue::Object(map) => {
-            for v in map.values() {
-                collect_strings(v, out);
+            let kind = map.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            for (key, v) in map {
+                let skip = match key.as_str() {
+                    "base64" | "tool_use_id" => true,
+                    "signature" => kind == "thinking",
+                    "data" => matches!(kind, "base64" | "redacted_thinking"),
+                    "id" => matches!(kind, "message" | "tool_use"),
+                    _ => false,
+                };
+                if !skip {
+                    walk_strings(v, f);
+                }
             }
         }
         _ => {}
     }
+}
+
+/// Read results reach the message as `12\tline` (or `12→line`); toolUseResult
+/// holds the same lines bare.
+fn strip_line_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split('\n') {
+        let rest = line.trim_start_matches(' ');
+        let body = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+        let stripped = if body.len() < rest.len() {
+            body.strip_prefix('\t').or_else(|| body.strip_prefix('→'))
+        } else {
+            None
+        };
+        out.push_str(stripped.unwrap_or(line));
+        out.push('\n');
+    }
+    out
 }
 
 fn count_stats(obj: &serde_json::Map<String, JsonValue>, stats: &mut SessionStats) {
@@ -412,17 +536,20 @@ fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Walk an arbitrary JSON value and collect all string values containing `query` (lowercased).
-pub fn find_json_values(line: &str, query_lower: &str) -> Vec<String> {
+/// The indexed string values of a JSONL line (see [`for_each_indexed_string`])
+/// that contain `query_lower`, longest first. `None` when the line is not JSON.
+pub fn find_json_values(line: &str, query_lower: &str) -> Option<Vec<String>> {
     let line = line.trim();
     if !line.starts_with('{') {
-        return Vec::new();
+        return None;
     }
-    let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
-        return Vec::new();
-    };
+    let value = serde_json::from_str::<JsonValue>(line).ok()?;
     let mut out = Vec::new();
-    collect_matching_values(&value, query_lower, &mut out);
+    for_each_indexed_string(&value, &mut |s| {
+        if s.to_lowercase().contains(query_lower) {
+            out.push(s.to_string());
+        }
+    });
     out.sort_by(|a, b| {
         if a.len() != b.len() {
             b.len().cmp(&a.len())
@@ -430,26 +557,24 @@ pub fn find_json_values(line: &str, query_lower: &str) -> Vec<String> {
             a.cmp(b)
         }
     });
-    out
+    Some(out)
 }
 
-fn collect_matching_values(value: &JsonValue, query: &str, out: &mut Vec<String>) {
-    match value {
-        JsonValue::String(s) if s.len() > 1 && s.to_lowercase().contains(query) => {
-            out.push(s.clone());
+/// True when one of `needles_lower` occurs in what the index holds of `line`,
+/// not only in a skipped field — a uuid, a blob, a duplicated tool output.
+/// A line that is not JSON is taken as it is.
+pub fn indexed_text_matches(line: &str, needles_lower: &[String]) -> bool {
+    let Ok(value) = serde_json::from_str::<JsonValue>(line.trim()) else {
+        return true;
+    };
+    let mut found = false;
+    for_each_indexed_string(&value, &mut |s| {
+        if !found {
+            let lower = s.to_lowercase();
+            found = needles_lower.iter().any(|n| lower.contains(n.as_str()));
         }
-        JsonValue::Array(values) => {
-            for v in values {
-                collect_matching_values(v, query, out);
-            }
-        }
-        JsonValue::Object(map) => {
-            for v in map.values() {
-                collect_matching_values(v, query, out);
-            }
-        }
-        _ => {}
-    }
+    });
+    found
 }
 
 /// Find the last top-level `timestamp` field by scanning lines from the end.
@@ -478,7 +603,48 @@ pub fn last_message_time_ms(data: &[u8]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_line, edited_path, extract_session_title, extract_text, is_boilerplate_line};
+    use super::{
+        classify_line, edited_path, extract_session_title, extract_text, find_json_values,
+        indexed_text_matches, is_boilerplate_line,
+    };
+
+    #[test]
+    fn blobs_ids_and_duplicated_tool_output_are_not_indexed() {
+        let thinking = r#"{"type":"assistant","uuid":"UUIDWORD","message":{"id":"msg_IDWORD","type":"message","content":[{"type":"thinking","thinking":"THINKWORD","signature":"SIGWORD"},{"type":"tool_use","id":"toolu_TOOLWORD","name":"Read","input":{"file_path":"/p/a.rs"}}]}}"#;
+        let image = r#"{"type":"user","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMAGEWORD"}}]}}"#;
+        let body = "fn alpha() {}\nfn beta() { ORIGWORD }\nfn gamma() { more text to pass the length bar }";
+        let numbered = "1\tfn alpha() {}\n2\tfn beta() { ORIGWORD }\n3\tfn gamma() { more text to pass the length bar }";
+        let read = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_X", "content": numbered}]},
+            "toolUseResult": {
+                "type": "text",
+                "file": {"filePath": "/p/a.rs", "content": body},
+                "bashEditDiff": "@@ -1 +1 @@ DIFFWORD and enough text to be over the dedup bar",
+            },
+        })
+        .to_string();
+        let snapshot = r#"{"type":"file-history-snapshot","snapshot":{"trackedFileBackups":{"/p/SNAPWORD.rs":{}}}}"#;
+        let enqueue = r#"{"type":"queue-operation","operation":"enqueue","content":"ENQUEUEWORD"}"#;
+        let removed = r#"{"type":"queue-operation","operation":"remove","content":"REMOVEDWORD"}"#;
+        let data = [thinking, image, &read, snapshot, enqueue, removed].join("\n");
+
+        let (text, _) = extract_text(data.as_bytes());
+        for gone in ["UUIDWORD", "msg_IDWORD", "SIGWORD", "toolu_TOOLWORD", "IMAGEWORD", "SNAPWORD", "ENQUEUEWORD"] {
+            assert!(!text.contains(gone), "{gone} should not be indexed");
+        }
+        for kept in ["THINKWORD", "DIFFWORD", "REMOVEDWORD", "/p/a.rs"] {
+            assert!(text.contains(kept), "{kept} should be indexed");
+        }
+        assert_eq!(text.matches("ORIGWORD").count(), 1, "Read content is indexed once, from the message");
+
+        assert!(!indexed_text_matches(thinking, &["sigword".into()]));
+        assert!(indexed_text_matches(thinking, &["thinkword".into()]));
+        assert_eq!(find_json_values(thinking, "sigword"), Some(vec![]));
+        assert!(is_boilerplate_line(snapshot));
+        assert!(is_boilerplate_line(enqueue));
+        assert!(!is_boilerplate_line(removed));
+    }
 
     #[test]
     fn edits_are_recognised_whoever_made_them() {

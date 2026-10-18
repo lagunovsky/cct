@@ -15,7 +15,7 @@ use crate::path_codec::parse_file_path;
 use crate::term::{fmt_size, highlight, CYAN, DIM, GRAY, RESET};
 use crate::text::{
     classify_line, edited_path, extract_top_level_timestamp_ms, find_json_values,
-    is_boilerplate_line, is_meta_content, rewrite_slash_command,
+    indexed_text_matches, is_boilerplate_line, is_meta_content, rewrite_slash_command,
 };
 
 use super::build::{read_file_range, stored_string, stored_u64};
@@ -713,6 +713,7 @@ fn snippets_for_hits(
             variants
         })
         .collect();
+    let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
     let mut budget = 6usize;
 
     // Archived sessions: the live file is gone — decompress the zstd twin
@@ -775,7 +776,7 @@ fn snippets_for_hits(
             // Indexes built before boilerplate was excluded still hold it; and
             // a chunk matched on real content must not surface the system
             // prompt or CLAUDE.md as its snippet either.
-            if is_boilerplate_line(line) {
+            if is_boilerplate_line(line) || !indexed_text_matches(line, &needles_lower) {
                 continue;
             }
             match_lines += 1;
@@ -859,14 +860,17 @@ fn extract_all_snippets(
     max_count: usize,
 ) -> Vec<String> {
     let q_lower = query.to_lowercase();
-    let mut values = find_json_values(line, &q_lower);
-    if values.is_empty() {
+    // A JSON line yields only its indexed values — none may match when the
+    // needle sat in a skipped field. Anything else is shown as raw text.
+    let values = if let Some(values) = find_json_values(line, &q_lower) {
+        values
+    } else {
         let mut clean = line.replace("\\n", " ");
         clean = clean.replace("\\t", " ");
         clean = clean.replace("\\\"", "\"");
         clean = clean.replace("\\\\", "\\");
-        values = vec![clean];
-    }
+        vec![clean]
+    };
 
     let mut results: Vec<String> = Vec::new();
     'outer: for value in values {
