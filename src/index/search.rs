@@ -14,8 +14,8 @@ use tantivy::{Index, TantivyDocument, Term};
 use crate::path_codec::parse_file_path;
 use crate::term::{fmt_size, highlight, CYAN, DIM, GRAY, RESET};
 use crate::text::{
-    classify_line, extract_top_level_timestamp_ms, find_json_values, is_meta_content,
-    rewrite_slash_command,
+    classify_line, extract_top_level_timestamp_ms, find_json_values, is_boilerplate_line,
+    is_meta_content, rewrite_slash_command,
 };
 
 use super::build::{read_file_range, stored_string, stored_u64};
@@ -759,6 +759,12 @@ fn snippets_for_hits(
             }
             let abs = start as usize + line_start;
             if !seen_lines.insert(abs) {
+                continue;
+            }
+            // Indexes built before boilerplate was excluded still hold it; and
+            // a chunk matched on real content must not surface the system
+            // prompt or CLAUDE.md as its snippet either.
+            if is_boilerplate_line(line) {
                 continue;
             }
             match_lines += 1;

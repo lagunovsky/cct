@@ -1446,3 +1446,41 @@ fn tidy_keeps_main_bounded_across_many_daemon_cycles() -> Result<()> {
     );
     Ok(())
 }
+
+/// The CLAUDE.md/memory attachment Claude Code writes into every session.
+fn jsonl_memory_attachment(text: &str) -> String {
+    format!(
+        r#"{{"type":"attachment","timestamp":"2026-10-01T12:00:00Z","attachment":{{"type":"instructions","files":[{{"path":"/Users/x/.claude/CLAUDE.md","type":"User","content":"{}"}}]}}}}"#,
+        text.replace('"', "\\\"")
+    )
+}
+
+#[test]
+fn memory_attachments_do_not_make_every_session_match() -> Result<()> {
+    let fx = Fixture::new()?;
+    let memory = jsonl_memory_attachment("always use MEMOTERM for commits");
+    for i in 0..5 {
+        fx.write_session(
+            &format!("session-boiler-{i}"),
+            &format!("{memory}\n{}\n", jsonl_user("unrelated work")),
+        );
+    }
+    fx.write_session(
+        "session-real",
+        &format!("{memory}\n{}\n", jsonl_user("why does MEMOTERM break the hook")),
+    );
+    fx.full_reindex()?;
+
+    let hits = fx.search("MEMOTERM", SearchMode::Auto);
+    assert_eq!(
+        hits.iter().map(|s| s.session_id.as_str()).collect::<Vec<_>>(),
+        vec!["session-real"],
+        "only the session that discussed it, not every session carrying the memory"
+    );
+    assert!(
+        hits[0].snippets.iter().all(|s| !s.text.contains("for commits")),
+        "the memory line itself must not be shown as a snippet: {:?}",
+        hits[0].snippets
+    );
+    Ok(())
+}

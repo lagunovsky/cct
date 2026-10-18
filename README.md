@@ -18,6 +18,17 @@ The corpus comes from the standard Claude Code layout:
 
 PDFs and other binary tool-results are deliberately not indexed.
 
+Neither are the `attachment` records Claude Code writes into every session —
+the system prompt snapshot, skill and tool listings, CLAUDE.md and auto-memory,
+output style, environment, model, date. Since September 2026 they are about
+2 GB of a 10.8 GB corpus and identical across sessions, so a word from your
+instructions or memory used to match thousands of sessions at once. The
+attachments that record what happened in a session stay indexed: prompts queued
+while the agent worked, subagent `structured_output`, edited files, diagnostics,
+todos, hook errors, plans. The exclusion list is `BOILERPLATE_ATTACHMENTS` in
+`src/text.rs`; snippets skip those lines too, so an index built before the
+change stops showing them even before `cct reindex`.
+
 ## Install
 
 ```sh

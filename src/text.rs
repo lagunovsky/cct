@@ -21,6 +21,9 @@ pub fn extract_text(data: &[u8]) -> (String, SessionStats) {
         }
         match serde_json::from_slice::<JsonValue>(line) {
             Ok(value) => {
+                if is_boilerplate_record(&value) {
+                    continue;
+                }
                 collect_strings(&value, &mut buf);
                 if let JsonValue::Object(map) = &value {
                     count_stats(map, &mut stats);
@@ -33,6 +36,81 @@ pub fn extract_text(data: &[u8]) -> (String, SessionStats) {
         buf.push(' ');
     }
     (buf, stats)
+}
+
+/// `attachment` records Claude Code writes into every session: the system
+/// prompt, the skill and tool listings, CLAUDE.md and auto-memory, output style,
+/// environment, model, date. Since September 2026 they are ~2 GB of a 10.8 GB
+/// corpus and identical from one session to the next, so any word from the user's
+/// instructions or memory matched thousands of sessions at once.
+///
+/// A denylist rather than an allowlist on purpose: new types keep appearing, and
+/// a boilerplate one slipping through is visible noise that gets added here,
+/// while a meaningful one silently dropped by an allowlist would never be
+/// noticed. Kept indexed are the attachments that carry what happened in this
+/// session: `queued_command` (prompts typed while the agent worked),
+/// `structured_output` (subagent results), `edited_text_file`, `file`,
+/// `diagnostics`, `task_reminder`, `task_status`, hook errors and context,
+/// `plan_file_reference`.
+const BOILERPLATE_ATTACHMENTS: &[&str] = &[
+    "agent_listing_delta",
+    "auto_mode",
+    "auto_mode_exit",
+    "bash_output_audience_note",
+    "batching_reminder_sent",
+    "budget_usd",
+    "command_permissions",
+    "context_tip",
+    "credential_org",
+    "date",
+    "date_change",
+    "deferred_tools_delta",
+    "deferred_tools_record",
+    "elapsed_time_reminder",
+    "environment",
+    "hook_system_message",
+    "instructions",
+    "invoked_skills",
+    "language",
+    "mcp_instructions_delta",
+    "model",
+    "nested_memory",
+    "output_style",
+    "output_style_instructions",
+    "plan_mode",
+    "plan_mode_exit",
+    "prompt_snapshot",
+    "remote_session_change",
+    "session_context",
+    "silent_turn_reminder",
+    "skill_listing",
+    "thinking_drop",
+    "thinking_stripped",
+    "total_tokens_reminder",
+];
+
+/// True for a record that repeats session-independent context. See
+/// [`BOILERPLATE_ATTACHMENTS`].
+pub fn is_boilerplate_record(value: &JsonValue) -> bool {
+    if value.get("type").and_then(|v| v.as_str()) != Some("attachment") {
+        return false;
+    }
+    value
+        .get("attachment")
+        .and_then(|a| a.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| BOILERPLATE_ATTACHMENTS.contains(&t))
+}
+
+/// [`is_boilerplate_record`] for a raw JSONL line, cheap for every other line:
+/// only lines that mention an attachment are parsed.
+pub fn is_boilerplate_line(line: &str) -> bool {
+    if !line.contains("\"attachment\"") {
+        return false;
+    }
+    serde_json::from_str::<JsonValue>(line.trim())
+        .map(|v| is_boilerplate_record(&v))
+        .unwrap_or(false)
 }
 
 fn trim_ws(mut data: &[u8]) -> &[u8] {
@@ -338,7 +416,29 @@ pub fn last_message_time_ms(data: &[u8]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_session_title;
+    use super::{extract_session_title, extract_text, is_boilerplate_line};
+
+    #[test]
+    fn boilerplate_attachments_are_not_indexed_but_session_ones_are() {
+        let memory = r#"{"type":"attachment","attachment":{"type":"instructions","files":[{"path":"/Users/x/.claude/CLAUDE.md","content":"MEMORYWORD rule"}]}}"#;
+        let snapshot = r#"{"type":"attachment","attachment":{"type":"prompt_snapshot","systemPrompt":["PROMPTWORD"]}}"#;
+        let queued = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"QUEUEDWORD please"}}"#;
+        let result = r#"{"type":"attachment","attachment":{"type":"structured_output","data":{"verdict":"VERDICTWORD"}}}"#;
+        let user = r#"{"type":"user","message":{"content":"USERWORD here"}}"#;
+        let data = [memory, snapshot, queued, result, user].join("\n");
+
+        let (text, _) = extract_text(data.as_bytes());
+        assert!(!text.contains("MEMORYWORD"), "CLAUDE.md/memory is the same in every session");
+        assert!(!text.contains("PROMPTWORD"), "system prompt is the same in every session");
+        assert!(text.contains("QUEUEDWORD"), "a prompt typed mid-run is the user's");
+        assert!(text.contains("VERDICTWORD"), "subagent results belong to this session");
+        assert!(text.contains("USERWORD"));
+
+        assert!(is_boilerplate_line(memory));
+        assert!(is_boilerplate_line(snapshot));
+        assert!(!is_boilerplate_line(queued));
+        assert!(!is_boilerplate_line(user));
+    }
 
     #[test]
     fn extract_session_title_picks_last_agent_name() {
