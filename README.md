@@ -182,16 +182,27 @@ A single `cct update` is enough for normal use. The `daemon` subcommand wires
 that up to launchd at 30-minute intervals so most searches run on an already
 warm index.
 
-After a search, `cct` may compact append-only delta segments, but only after a
-delta sub-index reaches 8 segments. This avoids merging a large existing delta
-with every tiny new append.
+After a search, an update, a daemon run or an archive pass, `cct` tidies the
+index. The delta is merged once a sub-index reaches 8 segments. The main index
+is merged once it reaches 16 segments, or once more than 20% of its documents
+are deleted: the small segments, plus any segment that is more than 30% dead,
+fold into one, while the 4 largest healthy segments are left alone. That keeps
+each pass cheap — it touches what accumulated since the last one, not the
+gigabytes written by the reindex.
+
+Before this, nothing merged the main index except an explicit `cct compact`.
+Every flush commits a segment into main, and a flush re-adds a grown session
+whole while only marking its previous copy deleted. Ten weeks of the daemon
+flushing every 30 minutes left 3,500 segments per sub-index and 48% of all
+documents dead; with a term dictionary per segment, `.term` files alone took
+5.7 of the `word` index's 7 GB.
 
 ## Merge policy / memory
 
 | command   | merge policy default | memory default                                                       |
 |-----------|----------------------|----------------------------------------------------------------------|
 | `reindex` | `log` (Tantivy default) | physical RAM / 6, clamped 768 MB … 8192 MB, fallback 5048 MB      |
-| `update`  | `none` (no foreground merges) | 768 MB total, split per enabled index                       |
+| `update`  | `none` during the update, then the routine tidy above | 768 MB total, split per enabled index |
 | `compact` | `none` + explicit merge to `--target-segments` (default 1) | 768 MB                                                        |
 
 All three honor `--memory-mb`, `--worker-threads`, `--merge-threads`, and

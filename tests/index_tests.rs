@@ -12,8 +12,11 @@ use anyhow::Result;
 use cct::fs_scan::{collect_archived_layout, collect_cct_layout, collect_one_project};
 use cct::index::build::{run_full_reindex, subindex_segment_count};
 use cct::index::catalog::{read_catalog, read_delta_catalog};
-use cct::index::compact::{optimize_delta, DELTA_OPTIMIZE_MIN_SEGMENTS};
-use cct::index::schema::delta_dir;
+use cct::index::compact::{
+    optimize_delta, optimize_main, tidy_index, DELTA_OPTIMIZE_MIN_SEGMENTS, MAIN_KEEP_LARGEST,
+    MAIN_OPTIMIZE_MIN_SEGMENTS,
+};
+use cct::index::schema::{delta_dir, subindex_dir};
 use cct::index::search::{run_search, SearchMode, SearchOptions, SessionResult, SortBy};
 use cct::index::update::{build_plan, build_plan_scoped, flush_delta, needs_update, run_update};
 use cct::index::writer::WriterConfig;
@@ -1329,6 +1332,117 @@ fn a_fresh_equal_match_wins_on_recency() -> Result<()> {
         Some("session-newer"),
         "ranked: {:?}",
         ranked.iter().map(|s| (&s.session_id, s.score)).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+
+/// Segments and deleted documents in one main sub-index.
+fn main_segment_stats(fx: &Fixture, kind: IndexKind) -> Result<(usize, u32)> {
+    let index = tantivy::Index::open_in_dir(subindex_dir(&fx.index_dir, kind))?;
+    let metas = index.searchable_segment_metas()?;
+    let dead = metas.iter().map(|m| m.num_deleted_docs()).sum();
+    Ok((metas.len(), dead))
+}
+
+/// One daemon cycle as it happens in real use: the active session grows (its
+/// append lands in delta, the flush re-adds it whole into main and marks the
+/// previous copy deleted) and a new session appears. The new session is what
+/// keeps each segment alive — with the active one alone, tantivy drops a
+/// segment the moment all of its documents are deleted, and nothing piles up.
+fn daemon_cycle(fx: &Fixture, session_path: &std::path::Path, line: &str) -> Result<()> {
+    let mut content = fs::read_to_string(session_path)?;
+    content.push_str(&jsonl_user(line));
+    content.push('\n');
+    fs::write(session_path, content)?;
+    let n = fs::read_dir(&fx.project_dir)?.count();
+    fx.write_session(&format!("session-new-{n}"), &format!("{}\n", jsonl_user("unrelated chatter")));
+    fx.update()?;
+    flush_delta(&fx.index_dir, WriterConfig::for_incremental_update(), false)?;
+    Ok(())
+}
+
+#[test]
+fn optimize_main_folds_flush_segments_and_reclaims_dead_copies() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-growing",
+        &format!("{}\n", jsonl_user("opening MAINFOLD line")),
+    );
+    // A session that never changes shares the reindex segment, so that segment
+    // outlives the growing session's first flush and keeps its dead copy —
+    // exactly how the big post-reindex segments rot in real use. One worker
+    // thread, or each file would get a segment of its own and die whole.
+    fx.write_session("session-stable", &format!("{}\n", jsonl_user("stable neighbour")));
+    let config = WriterConfig {
+        worker_threads: Some(1),
+        ..WriterConfig::for_full_reindex()
+    };
+    run_full_reindex(
+        &fx.source,
+        &fx.index_dir,
+        &IndexKind::all(),
+        collect_cct_layout(&fx.source)?,
+        config,
+        false,
+    )?;
+
+    // What the daemon did for ten weeks: flush after flush, never a merge.
+    for i in 0..MAIN_OPTIMIZE_MIN_SEGMENTS {
+        daemon_cycle(&fx, &session_path, &format!("growth MAINFOLD {i}"))?;
+    }
+    let (before, dead_before) = main_segment_stats(&fx, IndexKind::Word)?;
+    assert!(
+        before >= MAIN_OPTIMIZE_MIN_SEGMENTS,
+        "each flush should add a main segment, got {before}"
+    );
+    assert!(dead_before > 0, "re-added sessions must leave dead copies behind");
+
+    assert!(optimize_main(&fx.index_dir, WriterConfig::for_delta_update())?.is_some());
+    let (after, dead_after) = main_segment_stats(&fx, IndexKind::Word)?;
+    assert!(
+        after <= MAIN_KEEP_LARGEST + 1,
+        "small segments should fold into one: {before} -> {after}"
+    );
+    assert_eq!(dead_after, 0, "merging must drop the dead copies");
+
+    // Same answers as before the merge: the first and the latest line, once.
+    let hits = fx.search("MAINFOLD", SearchMode::Auto);
+    assert_eq!(hits.len(), 1, "one session, not one per stale copy");
+    assert_session(&fx.search("opening", SearchMode::Auto), "session-growing");
+    let last = format!("growth MAINFOLD {}", MAIN_OPTIMIZE_MIN_SEGMENTS - 1);
+    assert_session(&fx.search(&last, SearchMode::Auto), "session-growing");
+
+    // A tidy main is left alone.
+    assert!(optimize_main(&fx.index_dir, WriterConfig::for_delta_update())?.is_none());
+    Ok(())
+}
+
+#[test]
+fn tidy_keeps_main_bounded_across_many_daemon_cycles() -> Result<()> {
+    let fx = Fixture::new()?;
+    let session_path = fx.write_session(
+        "session-daemon",
+        &format!("{}\n", jsonl_user("start BOUNDED")),
+    );
+    fx.full_reindex()?;
+
+    // Twice the threshold: without tidy this ends with as many segments as
+    // cycles (see the test above); with it, main never reaches the threshold.
+    let cycles = MAIN_OPTIMIZE_MIN_SEGMENTS * 2;
+    let mut peak = 0;
+    for i in 0..cycles {
+        daemon_cycle(&fx, &session_path, &format!("cycle BOUNDED {i}"))?;
+        tidy_index(&fx.index_dir)?;
+        peak = peak.max(main_segment_stats(&fx, IndexKind::Word)?.0);
+    }
+    assert!(
+        peak < MAIN_OPTIMIZE_MIN_SEGMENTS,
+        "main should never fragment past the threshold, peaked at {peak} over {cycles} cycles"
+    );
+    assert_session(
+        &fx.search(&format!("cycle BOUNDED {}", cycles - 1), SearchMode::Auto),
+        "session-daemon",
     );
     Ok(())
 }

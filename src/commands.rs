@@ -13,7 +13,7 @@ use crate::fs_scan::{
 };
 use crate::index::build::run_full_reindex;
 use crate::index::catalog::lock_index_exclusive;
-use crate::index::compact::{optimize_delta, run_compact};
+use crate::index::compact::{run_compact, tidy_index};
 use crate::index::search::{self, SearchOptions};
 use crate::index::update::{build_plan, build_plan_scoped, flush_delta, needs_update, run_update};
 use crate::index::writer::{MergePolicyMode, WriterConfig};
@@ -80,6 +80,7 @@ fn run_archive_cmd(args: cli::ArchiveCmd) -> Result<()> {
     let _lock = if index_dir.exists() && !args.dry_run {
         let lock = lock_index_exclusive(&index_dir)?;
         flush_delta(&index_dir, WriterConfig::for_incremental_update(), false)?;
+        tidy_index(&index_dir)?;
         Some(lock)
     } else {
         None
@@ -264,11 +265,15 @@ pub fn run_update_cmd(args: cli::UpdateCmd) -> Result<()> {
     let _lock = lock_index_exclusive(&index_dir)?;
     let files = collect_cct_layout(&source)?;
     let plan = build_plan(&index_dir, Some(source.clone()), files)?;
-    if !needs_update(&plan) {
+    if needs_update(&plan) {
+        run_update(&index_dir, plan, config, true)?;
+    } else {
         println!("Nothing to update.");
-        return Ok(());
     }
-    run_update(&index_dir, plan, config, true)?;
+    // Even with nothing new, an index fragmented by older builds gets folded.
+    if let Some(elapsed) = tidy_index(&index_dir)? {
+        println!("Merged fragmented segments in {elapsed:?}");
+    }
     Ok(())
 }
 
@@ -316,11 +321,13 @@ pub fn run_silent_update(index_dir: &Path, config: WriterConfig) -> Result<()> {
     let _lock = lock_index_exclusive(index_dir)?;
     let files = collect_cct_layout(&source)?;
     let plan = build_plan(index_dir, Some(source.clone()), files)?;
-    if !needs_update(&plan) {
-        return flush_delta(index_dir, config, false);
+    if needs_update(&plan) {
+        run_update(index_dir, plan, config, false)?;
     }
-    run_update(index_dir, plan, config, false)?;
     flush_delta(index_dir, config, false)?;
+    // The daemon is what commits into main most often; without this it is
+    // also what fragments main without bound.
+    tidy_index(index_dir)?;
     Ok(())
 }
 
@@ -607,9 +614,9 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         }
         // Same post-search index hygiene as the human path, quiet on success.
         if let Err(err) =
-            lock_index_exclusive(&index_dir).and_then(|_lock| optimize_delta(&index_dir, WriterConfig::for_delta_update()))
+            lock_index_exclusive(&index_dir).and_then(|_lock| tidy_index(&index_dir))
         {
-            eprintln!("delta optimize skipped: {err:#}");
+            eprintln!("index tidy skipped: {err:#}");
         }
         return Ok(());
     }
@@ -646,14 +653,12 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     }
     let render_elapsed = render_start.elapsed();
 
-    let mut delta_optimize_error: Option<String> = None;
-    let delta_config = WriterConfig::for_delta_update();
-    let delta_optimize_elapsed = match lock_index_exclusive(&index_dir)
-        .and_then(|_lock| optimize_delta(&index_dir, delta_config))
+    let mut tidy_error: Option<String> = None;
+    let tidy_elapsed = match lock_index_exclusive(&index_dir).and_then(|_lock| tidy_index(&index_dir))
     {
         Ok(elapsed) => elapsed,
         Err(err) => {
-            delta_optimize_error = Some(format!("{err:#}"));
+            tidy_error = Some(format!("{err:#}"));
             None
         }
     };
@@ -665,7 +670,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
             update_elapsed,
             search_elapsed,
             render_elapsed,
-            delta_optimize_elapsed,
+            tidy_elapsed,
         );
         if parts.len() > 1 {
             format!("{DIM} ({}){RESET}", format_timing_parts(&parts))
@@ -680,14 +685,14 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         count = to_show,
     );
     if args.verbose < 2 {
-        if let Some(delta_elapsed) = delta_optimize_elapsed {
-            if delta_elapsed >= Duration::from_secs(1) {
-                println!("{DIM}delta optimize {delta_elapsed:?}{RESET}");
+        if let Some(tidy) = tidy_elapsed {
+            if tidy >= Duration::from_secs(1) {
+                println!("{DIM}index tidy {tidy:?}{RESET}");
             }
         }
     }
-    if let Some(err) = delta_optimize_error {
-        eprintln!("{DIM}delta optimize skipped: {err}{RESET}");
+    if let Some(err) = tidy_error {
+        eprintln!("{DIM}index tidy skipped: {err}{RESET}");
     }
     Ok(())
 }
@@ -697,7 +702,7 @@ fn search_timing_parts(
     update_elapsed: Duration,
     search_elapsed: Duration,
     render_elapsed: Duration,
-    delta_optimize_elapsed: Option<Duration>,
+    tidy_elapsed: Option<Duration>,
 ) -> Vec<(&'static str, Duration)> {
     let mut parts: Vec<(&'static str, Duration)> = Vec::new();
     if scan_elapsed.as_millis() >= 5 {
@@ -710,8 +715,8 @@ fn search_timing_parts(
     if render_elapsed.as_millis() >= 5 {
         parts.push(("render", render_elapsed));
     }
-    if let Some(delta_elapsed) = delta_optimize_elapsed {
-        parts.push(("delta optimize", delta_elapsed));
+    if let Some(tidy) = tidy_elapsed {
+        parts.push(("index tidy", tidy));
     }
     parts
 }
@@ -855,7 +860,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn search_timing_parts_include_delta_optimize_when_it_ran() {
+    fn search_timing_parts_include_index_tidy_when_it_ran() {
         let parts = search_timing_parts(
             Duration::from_millis(1),
             Duration::ZERO,
@@ -865,7 +870,7 @@ mod tests {
         );
         let labels: Vec<&str> = parts.iter().map(|(label, _)| *label).collect();
 
-        assert_eq!(labels, vec!["search", "delta optimize"]);
-        assert!(format_timing_parts(&parts).contains("delta optimize 3.00ms"));
+        assert_eq!(labels, vec!["search", "index tidy"]);
+        assert!(format_timing_parts(&parts).contains("index tidy 3.00ms"));
     }
 }
