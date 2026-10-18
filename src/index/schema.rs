@@ -159,9 +159,14 @@ impl IndexKind {
     /// long investigation that actually discussed the term. Word postings
     /// therefore keep term frequencies; the ngram indexes do not, because a
     /// trigram's count says little and their postings are the bulky ones.
+    ///
+    /// Word postings also keep positions, so a multi-word query runs as a
+    /// phrase. Without them it is an AND of words inside a 512 KB chunk:
+    /// "code only adds" then matches most chunks of the corpus, and the five
+    /// that hold the phrase drown among candidates the snippet pass rejects.
     pub fn record_option(self) -> IndexRecordOption {
         match self {
-            IndexKind::Word => IndexRecordOption::WithFreqs,
+            IndexKind::Word => IndexRecordOption::WithFreqsAndPositions,
             IndexKind::Trigram | IndexKind::Path => IndexRecordOption::Basic,
         }
     }

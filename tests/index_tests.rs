@@ -677,7 +677,7 @@ fn short_pathish_query_still_searches_word_index() -> Result<()> {
     let fx = Fixture::new()?;
     fx.write_session(
         "session-short",
-        &format!("{}\n", jsonl_user("see c docs for details")),
+        &format!("{}\n", jsonl_user("see c/ docs for details")),
     );
     fx.full_reindex()?;
     // "c/" enables the Path subindex in auto mode but is too short for the
@@ -1082,12 +1082,15 @@ fn full_reindex_includes_archived_sessions() -> Result<()> {
     )?;
     assert!(!session.exists(), "live session should be gone after archive");
 
+    // Search would read the snippet from the real ~/.claude/archive, not this
+    // fixture's, so the index's own catalog is what tells what it holds.
+    let indexed = |fx: &Fixture| -> Result<bool> {
+        Ok(read_catalog(&fx.index_dir)?.iter().any(|e| e.path == session))
+    };
+
     // A live-only reindex drops the archived session — the bug being fixed.
     fx.full_reindex()?;
-    assert!(
-        fx.search("distinctivezebraword", SearchMode::Auto).is_empty(),
-        "live-only reindex must not surface the archived session"
-    );
+    assert!(!indexed(&fx)?, "live-only reindex must not index the archived session");
 
     // A reindex that also feeds the archive serves it again.
     let mut files = collect_cct_layout(&fx.source)?;
@@ -1101,10 +1104,7 @@ fn full_reindex_includes_archived_sessions() -> Result<()> {
         WriterConfig::for_full_reindex(),
         false,
     )?;
-    assert_session(
-        &fx.search("distinctivezebraword", SearchMode::Auto),
-        "zebra-session",
-    );
+    assert!(indexed(&fx)?, "a reindex fed the archive must index it again");
     Ok(())
 }
 
@@ -1524,5 +1524,63 @@ fn edits_by_python_script_and_by_edit_tool_are_both_recorded() -> Result<()> {
         "the attachment should read as an edit: {:?}",
         python.snippets
     );
+    Ok(())
+}
+
+fn search_limited(fx: &Fixture, queries: &[&str], limit: usize) -> Vec<SessionResult> {
+    let opts = SearchOptions {
+        queries: queries.iter().map(|q| q.to_string()).collect(),
+        mode: SearchMode::Auto,
+        limit,
+        context_chars: 80,
+        project_prefix: None,
+        fuzzy: false,
+        sort: SortBy::default(),
+    };
+    run_search(&fx.index_dir, &opts).unwrap()
+}
+
+#[test]
+fn phrase_of_common_words_is_found_past_the_candidate_limit() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Every decoy holds all three words, more often than the target does, so
+    // an AND of words ranks all of them above the one session with the phrase.
+    let decoy = "code adds only code adds only code adds only".repeat(5);
+    for i in 0..100 {
+        fx.write_session(&format!("decoy-{i:03}"), &format!("{}\n", jsonl_user(&decoy)));
+    }
+    fx.write_session(
+        "session-phrase",
+        &format!("{}\n", jsonl_user("this code only adds a check")),
+    );
+    fx.full_reindex()?;
+    let results = search_limited(&fx, &["code only adds"], 1);
+    assert_session(&results, "session-phrase");
+    assert_eq!(results.len(), 1, "decoys hold the words, not the phrase");
+    Ok(())
+}
+
+#[test]
+fn and_across_strings_sees_every_hit_not_the_best_few() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Each string alone matches 100 sessions more strongly than the one that
+    // holds both; a per-string top-N cut left that session out of the AND.
+    for i in 0..100 {
+        let alpha = "alphaword ".repeat(30);
+        let beta = "betaword ".repeat(30);
+        fx.write_session(&format!("alpha-{i:03}"), &format!("{}\n", jsonl_user(&alpha)));
+        fx.write_session(&format!("beta-{i:03}"), &format!("{}\n", jsonl_user(&beta)));
+    }
+    fx.write_session(
+        "session-both",
+        &format!(
+            "{}\n{}\n",
+            jsonl_user("alphaword once"),
+            jsonl_assistant("and betaword once")
+        ),
+    );
+    fx.full_reindex()?;
+    let results = search_limited(&fx, &["alphaword", "betaword"], 1);
+    assert_session(&results, "session-both");
     Ok(())
 }

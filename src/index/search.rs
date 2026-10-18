@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
-use tantivy::schema::IndexRecordOption;
+use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::schema::{FieldType, IndexRecordOption};
 use tantivy::{Index, TantivyDocument, Term};
 
 use crate::path_codec::parse_file_path;
@@ -204,7 +204,6 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
         bail!("empty query");
     }
 
-    let limit = candidate_limit(opts.limit);
     let project_id = opts
         .project_prefix
         .as_ref()
@@ -212,9 +211,11 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     let delta = delta_dir(index_dir);
     let roots = [index_dir.to_path_buf(), delta];
 
-    // Phase 1: index hits per query string, kept separate — the AND below is
-    // at session level, not chunk level, so the strings must not be merged
-    // into one boolean query.
+    // Phase 1: every index hit per query string, kept separate — the AND below
+    // is at session level, not chunk level, so the strings must not be merged
+    // into one boolean query. Every hit, not the best few: with a cut here a
+    // session matching both strings but neither strongly was lost before the
+    // AND ever saw it.
     let mut per_query_groups: Vec<BTreeMap<PathBuf, Vec<DocHit>>> = Vec::new();
     for query in &queries {
         let mut kinds = select_indexes(opts.mode, query);
@@ -236,7 +237,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
                 if !dir.exists() {
                     continue;
                 }
-                let rows = search_one_index(root, *kind, query, project_id.as_deref(), limit)
+                let rows = search_one_index(root, *kind, query, project_id.as_deref(), opts.fuzzy)
                     .with_context(|| {
                         format!("search {} index at {}", kind.as_str(), dir.display())
                     })?;
@@ -266,24 +267,21 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
         }
     }
 
-    // Phase 3: snippets and session assembly per query string, then merge.
+    // Phase 3: verify candidates against the files, best first, until enough
+    // sessions hold every query string as shown text — or the candidates or
+    // the budget run out. Index hits alone are not matches: a phrase may be
+    // split by punctuation, a trigram AND is only a guess at a substring.
+    let verified = verify_candidates(&queries, &per_query_groups, opts);
+
+    // Session assembly per query string, then merge.
     let catalog = load_catalog_render(index_dir)?;
     let mut merged: BTreeMap<String, SessionResult> = BTreeMap::new();
     // Per-session snippet lists, one slot per query string, so the final list
     // can interleave them — appending would let the first string's snippets
     // crowd the later ones out of the per-session cap entirely.
     let mut snippet_rounds: BTreeMap<String, Vec<Vec<Snippet>>> = BTreeMap::new();
-    for (query, groups) in queries.iter().zip(per_query_groups) {
-        let mut by_session =
-            build_session_results(groups, query, opts.context_chars, opts.fuzzy, catalog.as_ref());
-        if has_oversized_token(query) {
-            // The word index stores such a token by its first 32 chars, so two
-            // different blobs sharing a prefix land on the same term. Only the
-            // snippet pass has seen the whole string; without a snippet the
-            // session is an unverified prefix collision, not a match.
-            by_session.retain(|_, result| !result.snippets.is_empty());
-        }
-        for (id, mut result) in by_session {
+    for files in verified {
+        for (id, mut result) in build_session_results(files, catalog.as_ref()) {
             snippet_rounds
                 .entry(id.clone())
                 .or_default()
@@ -299,7 +297,14 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
         }
     }
     for (id, rounds) in snippet_rounds {
-        if let Some(session) = merged.get_mut(&id) {
+        // Only the snippet pass has seen the text, so a session without a
+        // snippet for some string is not a match: an AND the index guessed
+        // from separate chunks, or a long token whose 32-char prefix it
+        // shares with another blob (see `has_oversized_token`).
+        let shown = rounds.iter().filter(|r| !r.is_empty()).count();
+        if shown < queries.len() {
+            merged.remove(&id);
+        } else if let Some(session) = merged.get_mut(&id) {
             session.snippets = interleave_snippets(rounds, MAX_SNIPPETS_PER_SESSION);
         }
     }
@@ -390,8 +395,126 @@ fn interleave_snippets(rounds: Vec<Vec<Snippet>>, cap: usize) -> Vec<Snippet> {
     out
 }
 
+/// Chunks verified per query string before the results are first counted.
 fn candidate_limit(user_limit: usize) -> usize {
     user_limit.saturating_mul(8).max(user_limit.max(64))
+}
+
+/// Ceiling on chunks verified per query string. Past it, a query whose index
+/// hits keep failing the snippet pass returns what it has: each chunk is a
+/// read of up to 512 KB.
+const VERIFY_CAP: usize = 4000;
+
+/// One chunk to verify for one query string, with every index that hit it.
+struct Candidate {
+    path: PathBuf,
+    hits: Vec<DocHit>,
+}
+
+/// A query string's hits as chunks to verify, most promising first: word hits
+/// before trigram before path ones — scores from different indexes do not
+/// compare, but the index says how literal the match is — then by score.
+fn order_candidates(groups: &BTreeMap<PathBuf, Vec<DocHit>>) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = Vec::new();
+    for (path, hits) in groups {
+        let mut by_range: BTreeMap<Option<(u64, u64)>, Vec<DocHit>> = BTreeMap::new();
+        for hit in hits {
+            by_range.entry(hit.snippet_range).or_default().push(hit.clone());
+        }
+        out.extend(by_range.into_values().map(|hits| Candidate {
+            path: path.clone(),
+            hits,
+        }));
+    }
+    let rank = |c: &Candidate| {
+        c.hits
+            .iter()
+            .map(|h| (index_weight(h.kind), h.score))
+            .fold((0.0_f32, 0.0_f32), |a, b| if b > a { b } else { a })
+    };
+    out.sort_by(|a, b| {
+        rank(b)
+            .partial_cmp(&rank(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// What the snippet pass made of one file for one query string.
+type VerifiedFile = (PathBuf, Vec<DocHit>, FileScan);
+
+/// Scan candidates in rounds — the first as large as [`candidate_limit`], each
+/// next one twice the last — until `opts.limit` sessions show every query
+/// string. A fixed candidate count failed both ways: a phrase of common words
+/// had its few real matches ranked below the cut, and the search returned
+/// fewer sessions than asked while matching ones sat unverified.
+fn verify_candidates(
+    queries: &[&str],
+    per_query_groups: &[BTreeMap<PathBuf, Vec<DocHit>>],
+    opts: &SearchOptions,
+) -> Vec<Vec<VerifiedFile>> {
+    let candidates: Vec<Vec<Candidate>> = per_query_groups.iter().map(order_candidates).collect();
+    let mut cursors = vec![0usize; queries.len()];
+    let mut verified: Vec<BTreeMap<PathBuf, (Vec<DocHit>, FileScan)>> =
+        queries.iter().map(|_| BTreeMap::new()).collect();
+    let first = candidate_limit(opts.limit);
+    let cap = first.max(VERIFY_CAP);
+    let mut batch = first;
+    loop {
+        for (i, query) in queries.iter().enumerate() {
+            let end = (cursors[i] + batch).min(candidates[i].len()).min(cap);
+            if end <= cursors[i] {
+                continue;
+            }
+            let mut by_file: BTreeMap<PathBuf, Vec<DocHit>> = BTreeMap::new();
+            for c in &candidates[i][cursors[i]..end] {
+                by_file.entry(c.path.clone()).or_default().extend(c.hits.iter().cloned());
+            }
+            cursors[i] = end;
+            let entries: Vec<(PathBuf, Vec<DocHit>)> = by_file.into_iter().collect();
+            let scans = generate_snippets_parallel(&entries, query, opts.context_chars, opts.fuzzy);
+            for ((path, hits), scan) in entries.into_iter().zip(scans) {
+                let slot = verified[i].entry(path).or_default();
+                slot.0.extend(hits);
+                slot.1.absorb(scan);
+            }
+        }
+        let exhausted = cursors
+            .iter()
+            .zip(&candidates)
+            .all(|(cursor, c)| *cursor >= c.len().min(cap));
+        if exhausted || confirmed_sessions(&verified) >= opts.limit {
+            break;
+        }
+        batch = batch.saturating_mul(2);
+    }
+    verified
+        .into_iter()
+        .map(|files| {
+            files
+                .into_iter()
+                .map(|(path, (hits, scan))| (path, hits, scan))
+                .collect()
+        })
+        .collect()
+}
+
+/// Sessions with a snippet for every query string so far.
+fn confirmed_sessions(verified: &[BTreeMap<PathBuf, (Vec<DocHit>, FileScan)>]) -> usize {
+    let mut per_query = verified.iter().map(|files| {
+        files
+            .iter()
+            .filter(|(_, (_, scan))| !scan.snippets.is_empty())
+            .map(|(path, _)| parse_file_path(path).0)
+            .collect::<BTreeSet<String>>()
+    });
+    let Some(mut alive) = per_query.next() else {
+        return 0;
+    };
+    for set in per_query {
+        alive.retain(|id| set.contains(id));
+    }
+    alive.len()
 }
 
 /// How much a match is worth by where it sits. Tool output and hook chatter
@@ -440,21 +563,11 @@ fn group_hits_by_file(hits: Vec<DocHit>) -> BTreeMap<PathBuf, Vec<DocHit>> {
 }
 
 fn build_session_results(
-    by_file: BTreeMap<PathBuf, Vec<DocHit>>,
-    query: &str,
-    context_chars: usize,
-    fuzzy: bool,
+    files: Vec<VerifiedFile>,
     catalog: Option<&CatalogRender>,
 ) -> BTreeMap<String, SessionResult> {
-    // Phase 1 — generate snippets per file in parallel. Each `(path, hits)`
-    // entry is independent: it does its own disk read + JSON parse + scan.
-    // With many matched files this is the dominant cost; the merge in phase 2
-    // is cheap and stays single-threaded to preserve dedup/cap semantics.
-    let entries: Vec<(PathBuf, Vec<DocHit>)> = by_file.into_iter().collect();
-    let scanned = generate_snippets_parallel(&entries, query, context_chars, fuzzy);
-
     let mut by_session: BTreeMap<String, SessionResult> = BTreeMap::new();
-    for ((path, hits), scan) in entries.into_iter().zip(scanned) {
+    for (path, hits, scan) in files {
         let FileScan {
             snippets: file_snippets,
             match_lines,
@@ -594,6 +707,22 @@ pub struct FileScan {
     pub match_lines: u32,
     /// Paths edited on matched lines, when the match is in the path itself.
     pub edited_paths: BTreeSet<String>,
+}
+
+impl FileScan {
+    /// Fold in the scan of more chunks of the same file.
+    fn absorb(&mut self, other: FileScan) {
+        for s in other.snippets {
+            if self.snippets.len() >= MAX_SNIPPETS_PER_SESSION {
+                break;
+            }
+            if !self.snippets.iter().any(|existing| existing.text == s.text) {
+                self.snippets.push(s);
+            }
+        }
+        self.match_lines = (self.match_lines + other.match_lines).min(MATCH_LINE_CAP);
+        self.edited_paths.extend(other.edited_paths);
+    }
 }
 
 /// Ceiling on counted lines per file. A session that mentions the query 300
@@ -1073,7 +1202,7 @@ fn search_one_index(
     kind: IndexKind,
     query_text: &str,
     project_id: Option<&str>,
-    limit: usize,
+    fuzzy: bool,
 ) -> Result<Vec<DocHit>> {
     let dir = subindex_dir(root, kind);
     let index =
@@ -1083,8 +1212,11 @@ fn search_one_index(
     let fields = fields_from_schema(&schema)?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
-    let query = build_query(kind, &fields, query_text, project_id)?;
-    let top = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
+    // A fuzzy query wants its words anywhere in the chunk, not side by side.
+    let phrase = !fuzzy && has_positions(&schema, fields.text);
+    let query = build_query(kind, &fields, query_text, project_id, phrase)?;
+    let all = (searcher.num_docs() as usize).max(1);
+    let top = searcher.search(&query, &TopDocs::with_limit(all).order_by_score())?;
 
     let mut hits = Vec::new();
     for (score, address) in top {
@@ -1109,11 +1241,25 @@ fn search_one_index(
     Ok(hits)
 }
 
+/// True when `field` was indexed with positions — word indexes built before
+/// positions were added have none, and a phrase query on them is an error.
+fn has_positions(schema: &tantivy::schema::Schema, field: tantivy::schema::Field) -> bool {
+    match schema.get_field_entry(field).field_type() {
+        FieldType::Str(options) => options
+            .get_indexing_options()
+            .is_some_and(|i| i.index_option().has_positions()),
+        _ => false,
+    }
+}
+
+/// The query for one string in one index: a phrase when the index keeps
+/// positions and `phrase` allows it, otherwise every token somewhere in the chunk.
 fn build_query(
     kind: IndexKind,
     fields: &super::schema::Fields,
     query: &str,
     project_id: Option<&str>,
+    phrase: bool,
 ) -> Result<Box<dyn Query>> {
     let tokens = query_tokens(kind, query)?;
     if tokens.is_empty() {
@@ -1122,16 +1268,29 @@ fn build_query(
             kind.as_str()
         );
     }
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = tokens
-        .into_iter()
-        .map(|t| {
-            let term = Term::from_field_text(fields.text, &t);
-            // Must match how the field was indexed, or the scorer reads no
-            // frequencies and falls back to ranking by document length.
-            let q: Box<dyn Query> = Box::new(TermQuery::new(term, kind.record_option()));
-            (Occur::Must, q)
-        })
-        .collect();
+    let positioned = if phrase && kind == IndexKind::Word {
+        positioned_tokens(query)
+    } else {
+        Vec::new()
+    };
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = if positioned.len() >= 2 {
+        let terms = positioned
+            .into_iter()
+            .map(|(pos, t)| (pos, Term::from_field_text(fields.text, &t)))
+            .collect();
+        vec![(Occur::Must, Box::new(PhraseQuery::new_with_offset(terms)))]
+    } else {
+        tokens
+            .into_iter()
+            .map(|t| {
+                let term = Term::from_field_text(fields.text, &t);
+                // Must match how the field was indexed, or the scorer reads no
+                // frequencies and falls back to ranking by document length.
+                let q: Box<dyn Query> = Box::new(TermQuery::new(term, kind.record_option()));
+                (Occur::Must, q)
+            })
+            .collect()
+    };
     if let Some(project_id) = project_id {
         let term = Term::from_field_text(fields.project_id, project_id);
         let q: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
@@ -1145,6 +1304,17 @@ fn query_tokens(kind: IndexKind, query: &str) -> Result<Vec<String>> {
         IndexKind::Word => token_text(WORD_TOKENIZER, query),
         IndexKind::Trigram | IndexKind::Path => token_text(NGRAM_TOKENIZER, query),
     }
+}
+
+/// Word tokens of `text` in order, with their positions, for a phrase query.
+fn positioned_tokens(text: &str) -> Vec<(usize, String)> {
+    let mut analyzer = word_analyzer();
+    let mut stream = analyzer.token_stream(text);
+    let mut out = Vec::new();
+    while let Some(token) = stream.next() {
+        out.push((token.position, token.text.clone()));
+    }
+    out
 }
 
 fn token_text(name: &str, text: &str) -> Result<Vec<String>> {

@@ -33,7 +33,7 @@ Copies are left out as well: base64 (thinking signatures, images), per-record
 uuids and timestamps, `api-request*` and `file-history-snapshot` records,
 queued prompts that were later delivered, and `toolUseResult` strings the
 record's tool_result already holds. On a 19.7 GB corpus this took the index
-from 3.2 GB to 0.6 GB. Snippets come from the same fields, so a session is never
+from 3.2 GB to 0.6 GB (before word positions, below). Snippets come from the same fields, so a session is never
 found through text it cannot show. See `for_each_indexed_string`.
 
 ## Install
@@ -164,12 +164,21 @@ as a tiebreaker between comparable matches rather than the answer itself.
 Counting matched lines rather than trusting Tantivy's BM25 is deliberate: a
 document here is a 512 KB chunk, and BM25's length normalization cancels out
 almost exactly the term frequency it is supposed to reward. BM25 still decides
-which chunks come back as candidates.
+the order in which candidate chunks are verified: the best ones first, in
+rounds that double in size, until `-n` sessions show a snippet for every query
+string (or 4000 chunks per string have been read).
+
+The word index keeps token positions, so a multi-word string is a phrase query
+there rather than an AND of words anywhere in a 512 KB chunk. Without them a
+phrase of common words ("could refute this") matched thousands of chunks, the
+real ones never reached the front, and the search came back empty. Positions
+triple the index (0.6 → 2.0 GB on a 19.7 GB corpus). Several query strings
+are AND-ed over every index hit, not over each string's best few.
 
 `--sort time` restores the old behaviour — newest session first, regardless of
 match quality. `--json` reports the pre-damping score per session.
 
-Multi-word queries are AND-ed and matched as a phrase on one line by default.
+Multi-word queries are matched as a phrase on one line by default.
 Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets
 even when the full phrase never appears on a single line.
 
