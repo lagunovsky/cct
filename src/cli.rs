@@ -25,6 +25,8 @@ pub const KNOWN_SUBCOMMANDS: &[&str] = &[
     "r",
     "search",
     "s",
+    "blame",
+    "b",
     "reindex",
     "ri",
     "update",
@@ -77,6 +79,10 @@ pub enum Cmd {
     /// Full-text search across Claude Code sessions.
     #[command(visible_alias = "s")]
     Search(SearchCmd),
+
+    /// Which sessions discussed a file, and what they said about it.
+    #[command(visible_alias = "b")]
+    Blame(BlameCmd),
 
     /// Rebuild the search index from scratch.
     #[command(visible_alias = "ri")]
@@ -161,10 +167,50 @@ pub struct SearchCmd {
     #[arg(long = "mode", value_enum, default_value_t = SearchMode::Auto)]
     pub mode: SearchMode,
 
+    /// Result order: best match first, or newest first.
+    #[arg(long = "sort", value_enum, default_value_t = SortBy::Relevance)]
+    pub sort: SortBy,
+
     /// Query strings; a session must match all of them (AND), anywhere in the
     /// session. Tokens inside one string are AND-ed in nearby context.
     #[arg(required = true, num_args = 1..)]
     pub query: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct BlameCmd {
+    /// Max sessions to show.
+    #[arg(short = 'n', long = "limit", default_value_t = 10)]
+    pub limit: usize,
+
+    /// Context characters around each mention.
+    #[arg(short = 'c', long = "context", default_value_t = 120)]
+    pub context: usize,
+
+    /// Verbose: -v shows file paths + agent/hook mentions; -vv also shows index update phases.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Look across all projects (default: current directory only).
+    #[arg(short, long, default_value_t = false)]
+    pub global: bool,
+
+    /// Restrict to a specific project path.
+    #[arg(short = 'p', long = "project")]
+    pub project: Option<String>,
+
+    /// Skip the auto incremental update before searching.
+    #[arg(long = "no-update", default_value_t = false)]
+    pub no_update: bool,
+
+    /// Machine-readable output: one JSON object per session on stdout.
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
+
+    /// File to blame. Existing paths are resolved against the filesystem;
+    /// anything else is taken as a path fragment or bare filename.
+    #[arg(required = true)]
+    pub path: String,
 }
 
 #[derive(Args, Debug)]
@@ -326,6 +372,15 @@ pub enum SearchMode {
     Word,
     Trigram,
     Path,
+}
+
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+pub enum SortBy {
+    /// Best match first: match quality and count, damped by session age.
+    #[default]
+    Relevance,
+    /// Newest session first.
+    Time,
 }
 
 pub fn parse_index_list(raw: &str) -> Option<BTreeSet<IndexKind>> {

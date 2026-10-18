@@ -30,6 +30,7 @@ pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
         None => show_recent_sessions(RecentOptions { limit: 20 }),
         Some(cli::Cmd::Recent(args)) => show_recent_sessions(RecentOptions { limit: args.limit }),
         Some(cli::Cmd::Search(args)) => run_search(args),
+        Some(cli::Cmd::Blame(args)) => run_blame(args),
         Some(cli::Cmd::Reindex(args)) => run_reindex(args),
         Some(cli::Cmd::Update(args)) => run_update_cmd(args),
         Some(cli::Cmd::Compact(args)) => run_compact_cmd(args),
@@ -323,6 +324,194 @@ pub fn run_silent_update(index_dir: &Path, config: WriterConfig) -> Result<()> {
     Ok(())
 }
 
+pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
+    let query = crate::blame::PathQuery::new(&args.path)
+        .ok_or_else(|| anyhow!("{:?} has no filename to blame", args.path))?;
+
+    let index_dir = index_root()?;
+    let source = projects_dir()?;
+    let resolved = resolve_project_scope(args.global, args.project.as_deref())?;
+    let project_prefix = resolved.as_ref().map(|r| r.prefix.clone());
+
+    let start = Instant::now();
+    if !args.json {
+        let scope = resolved
+            .as_ref()
+            .map(|r| r.label.clone())
+            .unwrap_or_else(|| "all projects".to_string());
+        println!(
+            "{BOLD}Sessions that touched:{RESET} {}  {DIM}({scope}){RESET}",
+            query.basename
+        );
+    }
+
+    refresh_index_for_search(
+        &index_dir,
+        &source,
+        project_prefix.as_deref(),
+        args.no_update,
+        args.verbose >= 2,
+    )?;
+
+    // Over-fetch: the basename is what the index can answer, and the verify
+    // pass below drops namesakes and prose, so the display limit has to be
+    // applied after ranking, not before it.
+    let sp = Spinner::start("searching...");
+    let opts = SearchOptions {
+        queries: vec![query.basename.clone()],
+        mode: search::SearchMode::Auto,
+        limit: args.limit.saturating_mul(4).max(40),
+        context_chars: args.context,
+        project_prefix,
+        fuzzy: false,
+        // Relevance already damps by age; blame re-sorts by how specifically
+        // each session named the file, keeping this order within each tier.
+        sort: search::SortBy::Relevance,
+    };
+    let mut sessions = search::run_search(&index_dir, &opts)?;
+    sp.stop();
+
+    // Verify, then tier: sessions naming a qualified path first, bare
+    // mentions after, anything that only looked like a match dropped.
+    let mut tiered: Vec<(crate::blame::Mention, search::SessionResult)> = Vec::new();
+    for session in sessions.drain(..) {
+        let best = session
+            .snippets
+            .iter()
+            .map(|s| query.classify(&s.text))
+            .max()
+            .unwrap_or(crate::blame::Mention::None);
+        if best == crate::blame::Mention::None {
+            continue;
+        }
+        tiered.push((best, session));
+    }
+    // Stable: within a tier the relevance order from the search survives.
+    tiered.sort_by_key(|(mention, _)| std::cmp::Reverse(*mention));
+
+    let total = tiered.len();
+    let to_show = total.min(args.limit);
+    if args.json {
+        let visible: Vec<&search::SessionResult> =
+            tiered.iter().take(to_show).map(|(_, s)| s).collect();
+        let stats_per_session = compute_session_stats_parallel(&visible);
+        for ((mention, s), stats) in tiered.iter().take(to_show).zip(stats_per_session) {
+            let mut value = search::session_json(
+                s,
+                stats.prompts,
+                stats.tools,
+                stats.bytes,
+                args.verbose >= 1,
+            );
+            value["mention"] = serde_json::json!(match mention {
+                crate::blame::Mention::Qualified => "qualified",
+                _ => "bare",
+            });
+            println!("{value}");
+        }
+        return Ok(());
+    }
+
+    if total == 0 {
+        println!("\n{DIM}No session mentions {}{RESET}", query.basename);
+        return Ok(());
+    }
+    let visible: Vec<&search::SessionResult> =
+        tiered.iter().take(to_show).map(|(_, s)| s).collect();
+    let stats_per_session = compute_session_stats_parallel(&visible);
+    let queries = vec![query.basename.clone()];
+    for ((_, s), stats) in tiered.iter().take(to_show).zip(stats_per_session) {
+        search::print_session_header(s, stats.prompts, stats.tools, stats.bytes);
+        search::print_snippets(&s.snippets, &queries, args.verbose >= 1, false);
+        if args.verbose >= 1 {
+            for f in &s.files {
+                println!("  {DIM}{}{RESET}", f.display());
+            }
+        }
+    }
+    if total > to_show {
+        println!(
+            "\n{DIM}...and {} more sessions. Use -n to show more.{RESET}",
+            total - to_show
+        );
+    }
+    println!(
+        "\n{DIM}{to_show} sessions in {elapsed:?}{RESET}",
+        elapsed = start.elapsed()
+    );
+    Ok(())
+}
+
+/// How long the pre-search index work took, for the `-vv` timing breakdown.
+struct IndexRefresh {
+    scan_elapsed: Duration,
+    update_elapsed: Duration,
+}
+
+/// Bring the index up to date before a read-only query: build it from scratch
+/// when missing, otherwise scan for changes and apply the incremental update.
+/// Shared by `search` and `blame`; the writer lock is released on return, since
+/// readers do not take it.
+fn refresh_index_for_search(
+    index_dir: &Path,
+    source: &Path,
+    project_prefix: Option<&Path>,
+    no_update: bool,
+    verbose_index: bool,
+) -> Result<IndexRefresh> {
+    let mut out = IndexRefresh {
+        scan_elapsed: Duration::ZERO,
+        update_elapsed: Duration::ZERO,
+    };
+    if no_update {
+        return Ok(out);
+    }
+    let _lock = lock_index_exclusive(index_dir)?;
+    if !index_dir.exists() {
+        maybe_warn_short_cleanup_period();
+        eprintln!("{DIM}Building initial index — this may take a while...{RESET}");
+        let config = WriterConfig::for_full_reindex();
+        let files = collect_for_full_reindex(source)?;
+        let upd_start = Instant::now();
+        run_full_reindex(
+            source,
+            index_dir,
+            &IndexKind::all(),
+            files,
+            config,
+            verbose_index,
+        )?;
+        out.update_elapsed = upd_start.elapsed();
+        return Ok(out);
+    }
+
+    let scan_start = Instant::now();
+    let sp = Spinner::start("scanning sessions...");
+    let (files, scope) = if let Some(prefix) = project_prefix {
+        (collect_one_project(prefix)?, Some(prefix))
+    } else {
+        (collect_cct_layout(source)?, None)
+    };
+    let plan = build_plan_scoped(index_dir, Some(source.to_path_buf()), files, scope)?;
+    let need = needs_update(&plan);
+    out.scan_elapsed = scan_start.elapsed();
+    if !need {
+        sp.stop();
+        return Ok(out);
+    }
+    let upd_start = Instant::now();
+    if verbose_index {
+        sp.stop();
+        run_update(index_dir, plan, WriterConfig::for_incremental_update(), true)?;
+    } else {
+        sp.set_message("updating index...");
+        run_update(index_dir, plan, WriterConfig::for_incremental_update(), false)?;
+        sp.stop();
+    }
+    out.update_elapsed = upd_start.elapsed();
+    Ok(out)
+}
+
 pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     // Each argument is one query string; a session must match all of them.
     let queries: Vec<String> = args
@@ -357,63 +546,16 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     }
 
     let verbose_index = args.verbose >= 2;
-    let mut scan_elapsed = Duration::ZERO;
-    let mut update_elapsed = Duration::ZERO;
-    if !args.no_update {
-        // Released before the read-only search below; readers are not locked.
-        let _lock = lock_index_exclusive(&index_dir)?;
-        if !index_dir.exists() {
-            maybe_warn_short_cleanup_period();
-            eprintln!("{DIM}Building initial index — this may take a while...{RESET}");
-            let config = WriterConfig::for_full_reindex();
-            let files = collect_for_full_reindex(&source)?;
-            let upd_start = Instant::now();
-            run_full_reindex(
-                &source,
-                &index_dir,
-                &IndexKind::all(),
-                files,
-                config,
-                verbose_index,
-            )?;
-            update_elapsed = upd_start.elapsed();
-        } else {
-            let scan_start = Instant::now();
-            let sp = Spinner::start("scanning sessions...");
-            let (files, scope) = if let Some(prefix) = project_prefix.as_deref() {
-                (collect_one_project(prefix)?, Some(prefix))
-            } else {
-                (collect_cct_layout(&source)?, None)
-            };
-            let plan = build_plan_scoped(&index_dir, Some(source.clone()), files, scope)?;
-            let need = needs_update(&plan);
-            scan_elapsed = scan_start.elapsed();
-            if need {
-                let upd_start = Instant::now();
-                if verbose_index {
-                    sp.stop();
-                    run_update(
-                        &index_dir,
-                        plan,
-                        WriterConfig::for_incremental_update(),
-                        true,
-                    )?;
-                } else {
-                    sp.set_message("updating index...");
-                    run_update(
-                        &index_dir,
-                        plan,
-                        WriterConfig::for_incremental_update(),
-                        false,
-                    )?;
-                    sp.stop();
-                }
-                update_elapsed = upd_start.elapsed();
-            } else {
-                sp.stop();
-            }
-        }
-    }
+    let IndexRefresh {
+        scan_elapsed,
+        update_elapsed,
+    } = refresh_index_for_search(
+        &index_dir,
+        &source,
+        project_prefix.as_deref(),
+        args.no_update,
+        verbose_index,
+    )?;
     let sp = Spinner::start("searching...");
 
     let mode = match args.mode {
@@ -423,6 +565,10 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         cli::SearchMode::Trigram => search::SearchMode::Only(IndexKind::Trigram),
         cli::SearchMode::Path => search::SearchMode::Only(IndexKind::Path),
     };
+    let sort = match args.sort {
+        cli::SortBy::Relevance => search::SortBy::Relevance,
+        cli::SortBy::Time => search::SortBy::Time,
+    };
     let opts = SearchOptions {
         queries: queries.clone(),
         mode,
@@ -430,6 +576,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         context_chars: args.context,
         project_prefix: project_prefix.clone(),
         fuzzy: args.fuzzy,
+        sort,
     };
     let search_start = Instant::now();
     let mut sessions = search::run_search(&index_dir, &opts)?;
@@ -604,13 +751,17 @@ struct ResolvedProject {
 }
 
 fn resolve_project_prefix(args: &cli::SearchCmd) -> Result<Option<ResolvedProject>> {
-    if args.global && args.project.is_some() {
+    resolve_project_scope(args.global, args.project.as_deref())
+}
+
+fn resolve_project_scope(global: bool, project: Option<&str>) -> Result<Option<ResolvedProject>> {
+    if global && project.is_some() {
         bail!("--global and --project are mutually exclusive");
     }
-    if args.global {
+    if global {
         return Ok(None);
     }
-    let abs = match args.project.as_deref() {
+    let abs = match project {
         Some(".") | None => std::env::current_dir()?,
         Some(p) => absolutize_lexical(p)?,
     };

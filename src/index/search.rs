@@ -9,7 +9,6 @@ use anyhow::{bail, Context, Result};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::tokenizer::{LowerCaser, NgramTokenizer, SimpleTokenizer, TextAnalyzer};
 use tantivy::{Index, TantivyDocument, Term};
 
 use crate::path_codec::parse_file_path;
@@ -22,8 +21,8 @@ use crate::text::{
 use super::build::{read_file_range, stored_string, stored_u64};
 use super::catalog::{catalog_path, read_catalog, CatalogDisplayStats};
 use super::schema::{
-    delta_dir, fields_from_schema, register_tokenizers, subindex_dir, IndexKind, NGRAM_TOKENIZER,
-    WORD_TOKENIZER,
+    delta_dir, fields_from_schema, is_oversized_word_token, ngram_analyzer, register_tokenizers,
+    subindex_dir, word_analyzer, IndexKind, NGRAM_TOKENIZER, WORD_TOKENIZER,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +55,49 @@ pub struct SearchOptions {
     pub context_chars: usize,
     pub project_prefix: Option<PathBuf>,
     pub fuzzy: bool,
+    pub sort: SortBy,
+}
+
+/// What decides the order of the sessions handed back.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SortBy {
+    /// Relevance: how well and how often the session matched, damped by age.
+    #[default]
+    Relevance,
+    /// Newest session first, regardless of match quality.
+    Time,
+}
+
+/// Per-index weight applied to a normalized hit score. A word hit is the query
+/// as typed; a trigram hit may be an accidental substring; a path hit says only
+/// that the file is named like the query, not that anything was discussed.
+fn index_weight(kind: IndexKind) -> f32 {
+    match kind {
+        IndexKind::Word => 1.0,
+        IndexKind::Trigram => 0.7,
+        IndexKind::Path => 0.4,
+    }
+}
+
+/// A match the user typed themselves outranks one buried in tool output — the
+/// same 1.3 deja gives user messages.
+const PROMPT_BOOST: f32 = 1.3;
+
+/// Age at which a session's score is halved.
+///
+/// deja uses `1/(1+age_days)` — a week-old session is already worth an eighth,
+/// so over a corpus spanning years the ranking collapses back into "newest
+/// first" with extra steps. Six months keeps recency as a tiebreaker between
+/// comparable matches while a genuinely better old session can still win, which
+/// is the whole point of asking "how did we solve this".
+const RECENCY_HALF_LIFE_DAYS: f64 = 180.0;
+
+fn recency_factor(last_msg_ms: i64, now_ms: i64) -> f32 {
+    if last_msg_ms <= 0 {
+        return 1.0;
+    }
+    let age_days = ((now_ms - last_msg_ms).max(0) as f64) / 86_400_000.0;
+    (1.0 / (1.0 + age_days / RECENCY_HALF_LIFE_DAYS)) as f32
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -88,6 +130,9 @@ pub struct SessionResult {
     pub title: Option<String>,
     /// The session lives in the zstd archive, not under `~/.claude/projects`.
     pub archived: bool,
+    /// Relevance before the age damping, summed over the query strings.
+    /// Meaningless across searches — only the order within one is.
+    pub score: f32,
 }
 
 pub fn select_indexes(mode: SearchMode, query: &str) -> Vec<IndexKind> {
@@ -134,6 +179,14 @@ pub fn looks_technical(q: &str) -> bool {
 
 pub fn looks_pathish(q: &str) -> bool {
     q.chars().any(|c| matches!(c, '/' | '\\' | '~'))
+}
+
+/// True when the query holds a run of alphanumerics longer than the word index
+/// stores in full — a key, a hash, a base64 chunk. It still matches, through
+/// its truncated prefix; the snippet pass is what confirms the whole string.
+pub fn has_oversized_token(q: &str) -> bool {
+    q.split(|c: char| !c.is_alphanumeric())
+        .any(is_oversized_word_token)
 }
 
 pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionResult>> {
@@ -217,8 +270,15 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     // crowd the later ones out of the per-session cap entirely.
     let mut snippet_rounds: BTreeMap<String, Vec<Vec<Snippet>>> = BTreeMap::new();
     for (query, groups) in queries.iter().zip(per_query_groups) {
-        let by_session =
+        let mut by_session =
             build_session_results(groups, query, opts.context_chars, opts.fuzzy, catalog.as_ref());
+        if has_oversized_token(query) {
+            // The word index stores such a token by its first 32 chars, so two
+            // different blobs sharing a prefix land on the same term. Only the
+            // snippet pass has seen the whole string; without a snippet the
+            // session is an unverified prefix collision, not a match.
+            by_session.retain(|_, result| !result.snippets.is_empty());
+        }
         for (id, mut result) in by_session {
             snippet_rounds
                 .entry(id.clone())
@@ -241,7 +301,37 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     }
 
     let mut sessions: Vec<SessionResult> = merged.into_values().collect();
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_msg_ms));
+    match opts.sort {
+        SortBy::Time => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_msg_ms)),
+        SortBy::Relevance => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            // The stored score stays age-free so `--json` consumers can see the
+            // textual relevance; only the ordering is damped.
+            let ranked: BTreeMap<String, f32> = sessions
+                .iter()
+                .map(|s| {
+                    let boost = if s.snippets.iter().any(|sn| sn.tag == "prompt") {
+                        PROMPT_BOOST
+                    } else {
+                        1.0
+                    };
+                    (
+                        s.session_id.clone(),
+                        s.score * boost * recency_factor(s.last_msg_ms, now_ms),
+                    )
+                })
+                .collect();
+            sessions.sort_by(|a, b| {
+                let (ra, rb) = (
+                    ranked.get(a.session_id.as_str()).copied().unwrap_or(0.0),
+                    ranked.get(b.session_id.as_str()).copied().unwrap_or(0.0),
+                );
+                rb.partial_cmp(&ra)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.last_msg_ms.cmp(&a.last_msg_ms))
+            });
+        }
+    }
     Ok(sessions)
 }
 
@@ -251,6 +341,9 @@ fn merge_session_meta(into: &mut SessionResult, add: SessionResult) {
     into.sources.extend(add.sources);
     into.files.extend(add.files);
     into.last_msg_ms = into.last_msg_ms.max(add.last_msg_ms);
+    // AND-ed query strings: a session that matched both well ranks above one
+    // that scraped through on the second string.
+    into.score += add.score;
     into.archived |= add.archived;
     if into.title.is_none() {
         into.title = add.title;
@@ -296,6 +389,36 @@ fn candidate_limit(user_limit: usize) -> usize {
     user_limit.saturating_mul(8).max(user_limit.max(64))
 }
 
+/// How much a match is worth by where it sits. Tool output and hook chatter
+/// repeat a term far more often than the conversation about it does, so an
+/// unweighted count would rank a session by how noisy its tools were.
+fn source_weight(source: &str) -> f32 {
+    match source {
+        "session" => 1.0,
+        "subagent" => 0.7,
+        _ => 0.5,
+    }
+}
+
+/// A file's contribution to its session's relevance: how many lines matched,
+/// weighted by where the file sits and by which index found it. Passed through
+/// `ln(1+x)` at the session level, so matching in twenty places beats matching
+/// in one without letting a sprawling session win on volume alone.
+///
+/// Tantivy's own BM25 decides which chunks come back, but cannot rank sessions:
+/// a document here is a 512 KB chunk, and BM25's length normalization then
+/// cancels out almost exactly the term frequency it is supposed to reward.
+fn file_relevance(hits: &[DocHit], source: &str, match_lines: u32) -> f32 {
+    let index_weight = hits
+        .iter()
+        .map(|h| index_weight(h.kind))
+        .fold(0.0_f32, f32::max);
+    // Path hits carry no byte range and so match no lines; they still say the
+    // file is named after the query.
+    let lines = match_lines.max(u32::from(hits.iter().all(|h| h.kind == IndexKind::Path)));
+    lines as f32 * source_weight(source) * index_weight
+}
+
 fn group_hits_by_file(hits: Vec<DocHit>) -> BTreeMap<PathBuf, Vec<DocHit>> {
     let mut by_file: BTreeMap<PathBuf, Vec<DocHit>> = BTreeMap::new();
     for hit in hits {
@@ -323,11 +446,16 @@ fn build_session_results(
     // With many matched files this is the dominant cost; the merge in phase 2
     // is cheap and stays single-threaded to preserve dedup/cap semantics.
     let entries: Vec<(PathBuf, Vec<DocHit>)> = by_file.into_iter().collect();
-    let snippets = generate_snippets_parallel(&entries, query, context_chars, fuzzy);
+    let scanned = generate_snippets_parallel(&entries, query, context_chars, fuzzy);
 
     let mut by_session: BTreeMap<String, SessionResult> = BTreeMap::new();
-    for ((path, _hits), file_snippets) in entries.into_iter().zip(snippets) {
+    for ((path, hits), scan) in entries.into_iter().zip(scanned) {
+        let FileScan {
+            snippets: file_snippets,
+            match_lines,
+        } = scan;
         let (session_id, project, source) = parse_file_path(&path);
+        let relevance = file_relevance(&hits, &source, match_lines);
         let entry = by_session
             .entry(session_id.clone())
             .or_insert_with(|| SessionResult {
@@ -340,8 +468,11 @@ fn build_session_results(
                 display_stats: catalog.map(|_| DisplayStats::default()),
                 title: None,
                 archived: false,
+                score: 0.0,
             });
         entry.sources.insert(source);
+        // Raw sum here; the ln() lands once per session in `finish_scores`.
+        entry.score += relevance;
         entry.archived |= !path.exists() && crate::archive::is_archived(&path);
         entry.files.insert(path.clone());
         apply_catalog_display_stats(entry, &path, catalog.map(|c| &c.stats));
@@ -389,6 +520,10 @@ fn build_session_results(
                 }
             }
         }
+    }
+    // Saturate once per session: twenty matches beat one, but not twentyfold.
+    for result in by_session.values_mut() {
+        result.score = (1.0 + result.score).ln();
     }
     by_session
 }
@@ -442,12 +577,26 @@ fn apply_catalog_display_stats(
     display_stats.bytes = display_stats.bytes.max(stats.bytes);
 }
 
+/// What one file's scan produced: the snippets worth showing, plus how many
+/// lines matched in total — the snippet budget stops rendering long before the
+/// scan stops counting, and relevance needs the count, not the render.
+#[derive(Default)]
+pub struct FileScan {
+    pub snippets: Vec<Snippet>,
+    pub match_lines: u32,
+}
+
+/// Ceiling on counted lines per file. A session that mentions the query 300
+/// times is not meaningfully more relevant than one that mentions it 200 —
+/// and the cap keeps a pathological chunk from scanning forever.
+const MATCH_LINE_CAP: u32 = 200;
+
 fn generate_snippets_parallel(
     entries: &[(PathBuf, Vec<DocHit>)],
     query: &str,
     context_chars: usize,
     fuzzy: bool,
-) -> Vec<Vec<Snippet>> {
+) -> Vec<FileScan> {
     let n = entries.len();
     if n <= 1 {
         return entries
@@ -468,13 +617,13 @@ fn generate_snippets_parallel(
             .collect();
     }
 
-    let mut out: Vec<Vec<Snippet>> = (0..n).map(|_| Vec::new()).collect();
+    let mut out: Vec<FileScan> = (0..n).map(|_| FileScan::default()).collect();
     let counter = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let counter = &counter;
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            handles.push(scope.spawn(move || -> Vec<(usize, Vec<Snippet>)> {
+            handles.push(scope.spawn(move || -> Vec<(usize, FileScan)> {
                 let mut local = Vec::new();
                 loop {
                     let i = counter.fetch_add(1, Ordering::Relaxed);
@@ -508,8 +657,9 @@ fn snippets_for_hits(
     query: &str,
     context_chars: usize,
     fuzzy: bool,
-) -> Vec<Snippet> {
+) -> FileScan {
     let mut out = Vec::new();
+    let mut match_lines = 0u32;
     let mut seen_lines = BTreeSet::new();
     let needles: Vec<String> = if fuzzy {
         let mut tokens: Vec<String> = query
@@ -563,7 +713,9 @@ fn snippets_for_hits(
     };
 
     for hit in hits {
-        if budget == 0 {
+        // The snippet budget only stops rendering; scanning continues until
+        // the counted-line cap, because relevance is measured in matches.
+        if budget == 0 && match_lines >= MATCH_LINE_CAP {
             break;
         }
         let Some((start, end)) = hit.snippet_range else {
@@ -609,6 +761,13 @@ fn snippets_for_hits(
             if !seen_lines.insert(abs) {
                 continue;
             }
+            match_lines += 1;
+            if budget == 0 {
+                if match_lines >= MATCH_LINE_CAP {
+                    break;
+                }
+                continue;
+            }
             let tag = classify_line(line);
             let ts = extract_top_level_timestamp_ms(line);
             for (needle, variants) in needles.iter().zip(needle_variants.iter()) {
@@ -636,12 +795,12 @@ fn snippets_for_hits(
                     break;
                 }
             }
-            if budget == 0 {
-                break;
-            }
         }
     }
-    out
+    FileScan {
+        snippets: out,
+        match_lines,
+    }
 }
 
 /// How `text` looks inside a JSON string literal, without the surrounding quotes.
@@ -939,7 +1098,9 @@ fn build_query(
         .into_iter()
         .map(|t| {
             let term = Term::from_field_text(fields.text, &t);
-            let q: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+            // Must match how the field was indexed, or the scorer reads no
+            // frequencies and falls back to ranking by document length.
+            let q: Box<dyn Query> = Box::new(TermQuery::new(term, kind.record_option()));
             (Occur::Must, q)
         })
         .collect();
@@ -960,12 +1121,8 @@ fn query_tokens(kind: IndexKind, query: &str) -> Result<Vec<String>> {
 
 fn token_text(name: &str, text: &str) -> Result<Vec<String>> {
     let mut analyzer = match name {
-        WORD_TOKENIZER => TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(LowerCaser)
-            .build(),
-        NGRAM_TOKENIZER => TextAnalyzer::builder(NgramTokenizer::new(3, 3, false)?)
-            .filter(LowerCaser)
-            .build(),
+        WORD_TOKENIZER => word_analyzer(),
+        NGRAM_TOKENIZER => ngram_analyzer()?,
         _ => bail!("unknown tokenizer {name}"),
     };
     let mut stream = analyzer.token_stream(text);
@@ -1028,6 +1185,9 @@ pub fn session_json(
         "prompts": prompts,
         "tools": tools,
         "bytes": bytes,
+        // Relevance before age damping. Comparable within one search only —
+        // an agent can tell "clearly the best hit" from "one of twenty".
+        "score": (s.score * 1000.0).round() / 1000.0,
         "snippets": snippets.iter().take(MAX_SNIPPETS_SHOWN).map(|sn| serde_json::json!({
             "tag": sn.tag,
             "time_ms": sn.time_ms,
@@ -1171,7 +1331,61 @@ mod tests {
             display_stats: None,
             title: Some("my-session".to_string()),
             archived: true,
+            score: 1.25,
         }
+    }
+
+    #[test]
+    fn recency_damps_but_does_not_decide() {
+        let now = 1_700_000_000_000;
+        let day = 86_400_000;
+        assert_eq!(recency_factor(now, now), 1.0);
+        // A month barely costs anything: relevance still decides.
+        let month = recency_factor(now - 30 * day, now);
+        assert!(month > 0.85, "30d factor was {month}");
+        // Half a year is worth half; a year, a third — a strong old match can
+        // still outrank a weak fresh one.
+        let half_year = recency_factor(now - 180 * day, now);
+        assert!((half_year - 0.5).abs() < 0.01, "180d factor was {half_year}");
+        let year = recency_factor(now - 365 * day, now);
+        assert!(year > 0.3 && year < 0.35, "365d factor was {year}");
+        // No timestamp (nothing on disk to date the session) is not punished.
+        assert_eq!(recency_factor(0, now), 1.0);
+    }
+
+    #[test]
+    fn file_relevance_counts_matches_and_discounts_noisy_sources() {
+        let hit = |kind| DocHit {
+            kind,
+            score: 4.0,
+            path: PathBuf::from("/p/-x/s.jsonl"),
+            file_id: 0,
+            chunk_id: 0,
+            snippet_range: Some((0, 10)),
+        };
+        let word = [hit(IndexKind::Word)];
+
+        // Twenty matching lines outweigh one — the count is the signal BM25
+        // over 512 KB chunks cannot give us.
+        assert!(
+            file_relevance(&word, "session", 20) > file_relevance(&word, "session", 1) * 10.0
+        );
+        // The same twenty matches in tool output are worth half as much.
+        assert_eq!(
+            file_relevance(&word, "tool-result", 20),
+            file_relevance(&word, "session", 20) * 0.5
+        );
+        // Substring evidence is discounted against a word match.
+        assert!(
+            file_relevance(&[hit(IndexKind::Trigram)], "session", 5)
+                < file_relevance(&word, "session", 5)
+        );
+        // A path-only hit matches no lines but still counts for something.
+        let path_hit = DocHit {
+            snippet_range: None,
+            ..hit(IndexKind::Path)
+        };
+        assert!(file_relevance(&[path_hit], "session", 0) > 0.0);
     }
 
     #[test]

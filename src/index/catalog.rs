@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::schema::IndexKind;
+use super::schema::{IndexKind, WORD_TOKEN_MAX_CHARS};
 use super::writer::WriterConfig;
 
 const CATALOG_HEADER: &str =
@@ -382,6 +382,9 @@ pub fn write_manifest(
             .collect::<Vec<_>>()
             .join(",")
     )?;
+    // Diagnostic: an index built before the cap still works (long tokens just
+    // sit there unused), but its `word` dir is several times larger.
+    writeln!(f, "word_token_max_chars={WORD_TOKEN_MAX_CHARS}")?;
     // Flush explicitly: a BufWriter drop swallows write errors, and a torn
     // manifest loses the `indexes=` line, breaking `--only` setups.
     f.flush()?;

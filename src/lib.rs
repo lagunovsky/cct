@@ -4,6 +4,7 @@
 //! here so integration tests can drive it directly.
 
 pub mod archive;
+pub mod blame;
 pub mod cli;
 pub mod commands;
 pub mod config;

@@ -6,11 +6,130 @@ use anyhow::Result;
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, INDEXED, STORED, STRING,
 };
-use tantivy::tokenizer::{LowerCaser, NgramTokenizer, SimpleTokenizer, TextAnalyzer};
+use tantivy::tokenizer::{
+    LowerCaser, NgramTokenizer, SimpleTokenizer, TextAnalyzer, Token, TokenFilter, TokenStream,
+    Tokenizer,
+};
 use tantivy::Index;
 
 pub const WORD_TOKENIZER: &str = "cct_word";
 pub const NGRAM_TOKENIZER: &str = "cct_ngram3";
+
+/// Word-index tokens are truncated to this many characters at index time.
+///
+/// Measured over a 300-file sample of real logs, tokens of 32+ chars are 30% of
+/// the vocabulary and 68% of its bytes, and 88% of them occur exactly once:
+/// base64 blobs, hashes and ids, not words anyone types. Keeping only their
+/// first 32 chars shrinks the term dictionary without making them unfindable —
+/// a query for the full string is truncated the same way, matches the same
+/// term, and the snippet pass then verifies the whole string against the file,
+/// so two blobs sharing a prefix cannot pass as each other.
+///
+/// Dropping them outright was the first attempt, on the theory that the trigram
+/// index would answer such queries as substrings. It does not: a 512 KB chunk
+/// contains nearly every trigram, so an AND over them barely narrows anything
+/// and the one chunk that holds the string never reaches the candidate limit.
+///
+/// Counted in chars, not bytes: `RemoveLongFilter` measures UTF-8 length, which
+/// would halve the budget for Cyrillic and cut real words in half.
+pub const WORD_TOKEN_MAX_CHARS: usize = 32;
+
+/// True when `token` reaches the word index only as its truncated prefix.
+pub fn is_oversized_word_token(token: &str) -> bool {
+    token.chars().count() > WORD_TOKEN_MAX_CHARS
+}
+
+/// The form an oversized token takes in the word index — and the form a query
+/// for it must take to match.
+pub fn truncate_word_token(token: &str) -> &str {
+    match token.char_indices().nth(WORD_TOKEN_MAX_CHARS) {
+        Some((byte_idx, _)) => &token[..byte_idx],
+        None => token,
+    }
+}
+
+/// Truncates tokens above `max_chars`. See [`WORD_TOKEN_MAX_CHARS`].
+#[derive(Clone)]
+pub struct TruncateFilter {
+    max_chars: usize,
+}
+
+impl TruncateFilter {
+    pub fn limit(max_chars: usize) -> Self {
+        Self { max_chars }
+    }
+}
+
+impl TokenFilter for TruncateFilter {
+    type Tokenizer<T: Tokenizer> = TruncateWrapper<T>;
+
+    fn transform<T: Tokenizer>(self, inner: T) -> Self::Tokenizer<T> {
+        TruncateWrapper {
+            max_chars: self.max_chars,
+            inner,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TruncateWrapper<T: Tokenizer> {
+    max_chars: usize,
+    inner: T,
+}
+
+impl<T: Tokenizer> Tokenizer for TruncateWrapper<T> {
+    type TokenStream<'a> = TruncateStream<T::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        TruncateStream {
+            max_chars: self.max_chars,
+            tail: self.inner.token_stream(text),
+        }
+    }
+}
+
+pub struct TruncateStream<T> {
+    max_chars: usize,
+    tail: T,
+}
+
+impl<T: TokenStream> TokenStream for TruncateStream<T> {
+    fn advance(&mut self) -> bool {
+        if !self.tail.advance() {
+            return false;
+        }
+        let token = self.tail.token_mut();
+        if let Some((byte_idx, _)) = token.text.char_indices().nth(self.max_chars) {
+            token.text.truncate(byte_idx);
+        }
+        true
+    }
+
+    fn token(&self) -> &Token {
+        self.tail.token()
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.tail.token_mut()
+    }
+}
+
+/// The analyzer behind [`WORD_TOKENIZER`]. Shared by index writes and query
+/// parsing so a query is tokenized exactly like the text it searches — in
+/// particular, an oversized token disappears from both sides.
+pub fn word_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .filter(TruncateFilter::limit(WORD_TOKEN_MAX_CHARS))
+        .build()
+}
+
+/// The analyzer behind [`NGRAM_TOKENIZER`], used by the trigram and path indexes.
+pub fn ngram_analyzer() -> Result<TextAnalyzer> {
+    Ok(TextAnalyzer::builder(NgramTokenizer::new(3, 3, false)?)
+        .filter(LowerCaser)
+        .build())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum IndexKind {
@@ -32,6 +151,18 @@ impl IndexKind {
         match self {
             IndexKind::Word => WORD_TOKENIZER,
             IndexKind::Trigram | IndexKind::Path => NGRAM_TOKENIZER,
+        }
+    }
+
+    /// What the postings carry. `Basic` stores doc ids only, which leaves BM25
+    /// with nothing but document length — a one-line session then outranks the
+    /// long investigation that actually discussed the term. Word postings
+    /// therefore keep term frequencies; the ngram indexes do not, because a
+    /// trigram's count says little and their postings are the bulky ones.
+    pub fn record_option(self) -> IndexRecordOption {
+        match self {
+            IndexKind::Word => IndexRecordOption::WithFreqs,
+            IndexKind::Trigram | IndexKind::Path => IndexRecordOption::Basic,
         }
     }
 
@@ -80,7 +211,7 @@ pub fn schema_and_fields(kind: IndexKind) -> (Schema, Fields) {
     let end_offset = builder.add_u64_field("end_offset", STORED);
     let text_indexing = TextFieldIndexing::default()
         .set_tokenizer(kind.tokenizer())
-        .set_index_option(IndexRecordOption::Basic);
+        .set_index_option(kind.record_option());
     let text = builder.add_text_field(
         "text",
         TextOptions::default().set_indexing_options(text_indexing),
@@ -112,14 +243,10 @@ pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
 }
 
 pub fn register_tokenizers(index: &Index) -> Result<()> {
-    let word = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(LowerCaser)
-        .build();
-    let trigram = TextAnalyzer::builder(NgramTokenizer::new(3, 3, false)?)
-        .filter(LowerCaser)
-        .build();
-    index.tokenizers().register(WORD_TOKENIZER, word);
-    index.tokenizers().register(NGRAM_TOKENIZER, trigram);
+    index.tokenizers().register(WORD_TOKENIZER, word_analyzer());
+    index
+        .tokenizers()
+        .register(NGRAM_TOKENIZER, ngram_analyzer()?);
     Ok(())
 }
 

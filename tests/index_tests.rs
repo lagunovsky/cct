@@ -14,7 +14,7 @@ use cct::index::build::{run_full_reindex, subindex_segment_count};
 use cct::index::catalog::{read_catalog, read_delta_catalog};
 use cct::index::compact::{optimize_delta, DELTA_OPTIMIZE_MIN_SEGMENTS};
 use cct::index::schema::delta_dir;
-use cct::index::search::{run_search, SearchMode, SearchOptions, SessionResult};
+use cct::index::search::{run_search, SearchMode, SearchOptions, SessionResult, SortBy};
 use cct::index::update::{build_plan, build_plan_scoped, flush_delta, needs_update, run_update};
 use cct::index::writer::WriterConfig;
 use cct::index::IndexKind;
@@ -101,6 +101,20 @@ impl Fixture {
             context_chars: 80,
             project_prefix: None,
             fuzzy: false,
+            sort: SortBy::default(),
+        };
+        run_search(&self.index_dir, &opts).unwrap_or_default()
+    }
+
+    fn search_sorted(&self, query: &str, sort: SortBy) -> Vec<SessionResult> {
+        let opts = SearchOptions {
+            queries: vec![query.to_string()],
+            mode: SearchMode::Auto,
+            limit: 20,
+            context_chars: 80,
+            project_prefix: None,
+            fuzzy: false,
+            sort,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -113,6 +127,7 @@ impl Fixture {
             context_chars: 80,
             project_prefix: None,
             fuzzy: false,
+            sort: SortBy::default(),
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -125,6 +140,7 @@ impl Fixture {
             context_chars: 80,
             project_prefix: None,
             fuzzy: true,
+            sort: SortBy::default(),
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -670,6 +686,7 @@ fn short_pathish_query_still_searches_word_index() -> Result<()> {
         context_chars: 80,
         project_prefix: None,
         fuzzy: false,
+        sort: SortBy::default(),
     };
     let results = run_search(&fx.index_dir, &opts)?;
     assert_session(&results, "session-short");
@@ -894,6 +911,7 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
         context_chars: 80,
         project_prefix: Some(fx.project_dir.clone()),
         fuzzy: false,
+        sort: SortBy::default(),
     };
     let results = run_search(&fx.index_dir, &opts)?;
     assert_session(&results, "session-scoped");
@@ -924,6 +942,7 @@ fn search_reports_incompatible_catalog() -> Result<()> {
         context_chars: 80,
         project_prefix: None,
         fuzzy: false,
+        sort: SortBy::default(),
     };
     let err = run_search(&fx.index_dir, &opts).expect_err("catalog schema must be strict");
     let message = format!("{err:#}");
@@ -1179,5 +1198,137 @@ fn multi_string_search_matches_across_session_files() -> Result<()> {
         results.iter().map(|r| &r.session_id).collect::<Vec<_>>()
     );
     assert_eq!(results[0].session_id, "session-spread");
+    Ok(())
+}
+
+#[test]
+fn oversized_tokens_are_indexed_by_prefix_and_verified_in_full() -> Result<()> {
+    let fx = Fixture::new()?;
+    // 44 chars: what an API key body or a base64 chunk looks like in a log.
+    // The two differ only after char 32, so the index cannot tell them apart.
+    let blob = "R8sTn4kQm2vX7wLp0zYc5bHj9dFgA1eKuI3oP6rT7wZq";
+    let twin = "R8sTn4kQm2vX7wLp0zYc5bHj9dFgA1eKDIFFERENTTAIL";
+    assert_eq!(blob[..32], twin[..32]);
+    fx.write_session(
+        "session-blob",
+        &format!("{}\n", jsonl_assistant(&format!("token={blob} rejected"))),
+    );
+    fx.write_session(
+        "session-twin",
+        &format!("{}\n", jsonl_assistant(&format!("token={twin} accepted"))),
+    );
+    fx.full_reindex()?;
+
+    // Both sessions share the indexed prefix, but only the one holding the
+    // full string survives: the snippet pass verifies it against the file.
+    let hits = fx.search(blob, SearchMode::Only(IndexKind::Word));
+    assert_session(&hits, "session-blob");
+    assert!(
+        !hits.iter().any(|s| s.session_id == "session-twin"),
+        "prefix twin must not pass as a match: {:?}",
+        hits.iter().map(|s| &s.session_id).collect::<Vec<_>>()
+    );
+    assert_session(&fx.search(blob, SearchMode::Auto), "session-blob");
+    Ok(())
+}
+
+#[test]
+fn long_identifier_under_the_cap_stays_in_the_word_index() -> Result<()> {
+    let fx = Fixture::new()?;
+    // 31 chars, one below the cap: a real identifier must not be swept up.
+    let ident = "shouldcancelpendingattachonclos";
+    fx.write_session(
+        "session-ident",
+        &format!("{}\n", jsonl_user(&format!("added {ident} to the suite"))),
+    );
+    fx.full_reindex()?;
+    assert_session(
+        &fx.search(ident, SearchMode::Only(IndexKind::Word)),
+        "session-ident",
+    );
+    Ok(())
+}
+
+#[test]
+fn cyrillic_words_are_capped_by_chars_not_bytes() -> Result<()> {
+    let fx = Fixture::new()?;
+    // 25 Cyrillic chars = 50 bytes: over a byte-based cap, under the char one.
+    let word = "переиспользованиеконтекст";
+    assert_eq!(word.chars().count(), 25);
+    fx.write_session(
+        "session-cyr",
+        &format!("{}\n", jsonl_user(&format!("обсудили {word} подробно"))),
+    );
+    fx.full_reindex()?;
+    assert_session(
+        &fx.search(word, SearchMode::Only(IndexKind::Word)),
+        "session-cyr",
+    );
+    Ok(())
+}
+
+/// One jsonl line dated `days_ago`, so ranking tests can age a session.
+fn jsonl_user_aged(text: &str, days_ago: i64) -> String {
+    let ts = chrono::Utc::now() - chrono::Duration::days(days_ago);
+    format!(
+        r#"{{"type":"user","timestamp":"{}","message":{{"content":"{}"}}}}"#,
+        ts.to_rfc3339(),
+        text.replace('"', "\\\"")
+    )
+}
+
+#[test]
+fn relevance_beats_recency_but_time_sort_still_works() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Nine months old, the query all over it: the session that actually
+    // answers "how did we deal with this".
+    let deep: String = (0..12)
+        .map(|i| format!("{}\n", jsonl_user_aged(&format!("kubelet eviction threshold pass {i}"), 270)))
+        .collect();
+    fx.write_session("session-deep", &deep);
+    // Yesterday, one passing mention.
+    fx.write_session(
+        "session-fresh",
+        &format!("{}\n", jsonl_user_aged("renamed a file, kubelet untouched", 1)),
+    );
+    fx.full_reindex()?;
+
+    let by_score = fx.search_sorted("kubelet", SortBy::Relevance);
+    assert_eq!(
+        by_score.first().map(|s| s.session_id.as_str()),
+        Some("session-deep"),
+        "relevance order: {:?}",
+        by_score.iter().map(|s| (&s.session_id, s.score)).collect::<Vec<_>>()
+    );
+
+    let by_time = fx.search_sorted("kubelet", SortBy::Time);
+    assert_eq!(
+        by_time.first().map(|s| s.session_id.as_str()),
+        Some("session-fresh"),
+        "time order: {:?}",
+        by_time.iter().map(|s| &s.session_id).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_fresh_equal_match_wins_on_recency() -> Result<()> {
+    let fx = Fixture::new()?;
+    // Same text, same shape, different age: recency is the tiebreaker.
+    for (name, age) in [("session-older", 400), ("session-newer", 2)] {
+        let body: String = (0..4)
+            .map(|i| format!("{}\n", jsonl_user_aged(&format!("keychain unlock prompt {i}"), age)))
+            .collect();
+        fx.write_session(name, &body);
+    }
+    fx.full_reindex()?;
+
+    let ranked = fx.search_sorted("keychain", SortBy::Relevance);
+    assert_eq!(
+        ranked.first().map(|s| s.session_id.as_str()),
+        Some("session-newer"),
+        "ranked: {:?}",
+        ranked.iter().map(|s| (&s.session_id, s.score)).collect::<Vec<_>>()
+    );
     Ok(())
 }

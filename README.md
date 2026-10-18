@@ -40,6 +40,8 @@ cct search -g "API error"        # global search across all projects
 cct search -p ../other "TODO"    # search a different project
 cct search -n 50 -c 200 "trace"
 cct search "auth" "timeout"      # AND: session must contain all strings
+cct search --sort time "auth"    # newest first instead of best match first
+cct blame src/index/search.rs    # sessions that discussed this file
 cct reindex                      # rebuild the index from scratch
 cct update                       # incremental update (also runs implicitly on search)
 cct compact                      # collapse Tantivy segments to a single one
@@ -57,6 +59,31 @@ cct daemon uninstall
   catalog.tsv   per-file row: file_id, kind, size, mtime_ms, indexed_offset, next_chunk_id, prompts, tools, display_bytes, title, path
   manifest.txt  source dir, enabled indexes, writer config used to build it
 ```
+
+The `word` index truncates tokens to 32 characters. On real logs everything
+above that length is base64 blobs, hashes and ids — 30% of the vocabulary and
+68% of its bytes, 88% of them seen exactly once — so storing only their prefix
+shrinks the term dictionary substantially without making them unfindable: a
+query for the full string is truncated the same way and matches the same term,
+and the snippet pass then verifies the whole string against the file, so two
+blobs sharing a prefix cannot pass as each other. The cap counts characters, not
+bytes, so Cyrillic words are not cut at half the length.
+
+Dropping oversized tokens instead was the first attempt — it shrinks `word` by
+~70% rather than by a prefix — on the theory that `trigram` could answer such
+queries as substrings. On the real index it cannot: a 512 KB chunk contains
+nearly every trigram, so AND-ing them barely narrows the candidate set and the
+one chunk holding the string never survives the candidate limit. Searching for a
+key you actually have is worth more than the extra megabytes.
+
+Word postings carry term frequencies (`WithFreqs`); the ngram indexes do not.
+Frequencies cost ~9% of the `word` index and are what let a chunk that mentions
+the query twenty times outrank one that mentions it once.
+
+Together, truncation and a fresh full merge took a real 10.4 GB corpus from a
+6.8 GB index to 2.2 GB (`word` 5.1 GB → 1.7 GB), and searches on it run in
+60–140 ms instead of 0.4–1.2 s. Old indexes keep working; `cct reindex` is what
+applies the change.
 
 `file_id` is stable across updates so deletes / re-adds use a single
 `delete_term` per physical index.
@@ -106,6 +133,24 @@ progress and warnings go to stderr. Content matches the human output — `-v`
 widens snippets to agent/hook matches and adds matched file paths, so shallow
 searches stay cheap by default.
 
+## Result order
+
+Results are ranked by relevance, not by date. A session's score is the number
+of lines that actually matched — weighted by where they matched (`session` 1.0,
+`subagent` 0.7, tool results and hooks 0.5) and by which index found them
+(`word` 1.0, `trigram` 0.7, `path` 0.4) — passed through `ln(1+x)` so a long
+session cannot win on volume alone. A match in your own prompt gets ×1.3, and
+the whole score is damped by age with a 180-day half life, which leaves recency
+as a tiebreaker between comparable matches rather than the answer itself.
+
+Counting matched lines rather than trusting Tantivy's BM25 is deliberate: a
+document here is a 512 KB chunk, and BM25's length normalization cancels out
+almost exactly the term frequency it is supposed to reward. BM25 still decides
+which chunks come back as candidates.
+
+`--sort time` restores the old behaviour — newest session first, regardless of
+match quality. `--json` reports the pre-damping score per session.
+
 Multi-word queries are AND-ed and matched as a phrase on one line by default.
 Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets
 even when the full phrase never appears on a single line.
@@ -152,6 +197,30 @@ with every tiny new append.
 All three honor `--memory-mb`, `--worker-threads`, `--merge-threads`, and
 `--only word,trigram,path`.
 
+## Blame
+
+`cct blame <path>` answers the other direction: not "where was this word
+discussed" but "which sessions worked on this file, and what did they say".
+
+```sh
+cct blame src/index/search.rs      # sessions in the current project
+cct blame -g Cargo.toml            # across all projects
+cct blame --json src/cli.rs        # one object per session, plus "mention"
+```
+
+The index knows nothing about which files a session touched — transcripts
+mention paths as ordinary text — so blame searches for the basename and then
+verifies every hit. A session that wrote `src/index/search.rs` (or any longer
+tail like `index/search.rs`) is a *qualified* mention and ranks above one that
+only wrote `search.rs`; a session where the name occurs inside a longer word
+(`research.rsync`) is dropped. Within each tier the normal relevance order
+applies.
+
+An existing path is resolved against the filesystem, so `cct blame ./cli.rs`
+and `cct blame src/cli.rs` behave the same. A path that no longer exists still
+works — it is matched as typed, which is the point when the file was deleted
+months ago.
+
 ## Rename / transfer
 
 If a project's directory was renamed or moved, `/resume` in Claude Code stops
@@ -195,7 +264,8 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 
 | Command | Description |
 |---------|-------------|
-| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--json`, `--mode`, `--no-update` |
+| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--json`, `--mode`, `--sort`, `--no-update` |
+| `cct blame <path>` | Which sessions discussed a file, and what they said; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `--json`, `--no-update` |
 | `cct recent` | Recent sessions in cwd; flag: `-n` |
 | `cct reindex` | Rebuild the Tantivy index from scratch |
 | `cct update` | Incremental update (auto on each search; manual when scripted) |
@@ -267,4 +337,13 @@ Integration tests live under `tests/index_tests.rs` and cover:
 - shrink/rewrite force a full reindex of the file,
 - path search finds sessions by their path,
 - snippets come from the chunk byte range,
-- PDFs and other binaries are skipped.
+- PDFs and other binaries are skipped,
+- an oversized token is found through its indexed prefix, while a different
+  blob sharing the same 32-char prefix is rejected by the snippet pass,
+- a 31-char identifier and a 25-char Cyrillic word are indexed whole,
+- relevance ranking puts a deep old match above a shallow fresh one, while
+  `--sort time` still returns newest first,
+- two equally strong matches are separated by recency.
+
+`src/blame.rs` unit-tests path recognition: qualified vs bare mentions,
+namesake rejection (`research.rsync`), and suffix generation.
