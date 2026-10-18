@@ -78,6 +78,7 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
             };
         print_session_summary(
             &session_id,
+            path,
             *mtime_ms,
             &prompts,
             total_prompts,
@@ -299,8 +300,10 @@ fn extract_assistant_text(message: Option<&JsonValue>) -> String {
     buf
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_session_summary(
     session_id: &str,
+    path: &Path,
     mtime_ms: i64,
     prompts: &[PromptPair],
     total_prompts: u32,
@@ -332,6 +335,7 @@ fn print_session_summary(
         _ => String::new(),
     };
     println!("\n{CYAN}{BOLD}{session_id}{RESET}{title}  {DIM}{when}{RESET}{stats}");
+    println!("  {DIM}{}{RESET}", path.display());
     if prompts.is_empty() {
         println!("  {DIM}(no user prompts){RESET}");
         return;
