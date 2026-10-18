@@ -378,16 +378,22 @@ pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
     let mut sessions = search::run_search(&index_dir, &opts)?;
     sp.stop();
 
-    // Verify, then tier: sessions naming a qualified path first, bare
-    // mentions after, anything that only looked like a match dropped.
+    // Verify, then tier: sessions that changed the file first — by any means,
+    // python scripts included — then qualified mentions, then bare ones;
+    // anything that only looked like a match is dropped.
     let mut tiered: Vec<(crate::blame::Mention, search::SessionResult)> = Vec::new();
     for session in sessions.drain(..) {
-        let best = session
-            .snippets
-            .iter()
-            .map(|s| query.classify(&s.text))
-            .max()
-            .unwrap_or(crate::blame::Mention::None);
+        let edited = session.edited_paths.iter().any(|p| query.is_same_file(p));
+        let best = if edited {
+            crate::blame::Mention::Edited
+        } else {
+            session
+                .snippets
+                .iter()
+                .map(|s| query.classify(&s.text))
+                .max()
+                .unwrap_or(crate::blame::Mention::None)
+        };
         if best == crate::blame::Mention::None {
             continue;
         }
@@ -411,6 +417,7 @@ pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
                 args.verbose >= 1,
             );
             value["mention"] = serde_json::json!(match mention {
+                crate::blame::Mention::Edited => "edited",
                 crate::blame::Mention::Qualified => "qualified",
                 _ => "bare",
             });
@@ -427,8 +434,13 @@ pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
         tiered.iter().take(to_show).map(|(_, s)| s).collect();
     let stats_per_session = compute_session_stats_parallel(&visible);
     let queries = vec![query.basename.clone()];
-    for ((_, s), stats) in tiered.iter().take(to_show).zip(stats_per_session) {
+    for ((mention, s), stats) in tiered.iter().take(to_show).zip(stats_per_session) {
         search::print_session_header(s, stats.prompts, stats.tools, stats.bytes);
+        if *mention == crate::blame::Mention::Edited {
+            for path in s.edited_paths.iter().filter(|p| query.is_same_file(p)) {
+                println!("  {BOLD}edited{RESET} {DIM}{path}{RESET}");
+            }
+        }
         search::print_snippets(&s.snippets, &queries, args.verbose >= 1, false);
         if args.verbose >= 1 {
             for f in &s.files {

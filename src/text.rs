@@ -95,11 +95,62 @@ pub fn is_boilerplate_record(value: &JsonValue) -> bool {
     if value.get("type").and_then(|v| v.as_str()) != Some("attachment") {
         return false;
     }
-    value
-        .get("attachment")
-        .and_then(|a| a.get("type"))
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| BOILERPLATE_ATTACHMENTS.contains(&t))
+    let Some(attachment) = value.get("attachment") else {
+        return false;
+    };
+    let kind = attachment.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if BOILERPLATE_ATTACHMENTS.contains(&kind) {
+        return true;
+    }
+    // An edit to CLAUDE.md or memory is broadcast as `edited_text_file` into
+    // every session open at the time — 20 sessions for one MEMORY.md change.
+    // The session that made the edit still shows it through its Edit/Write call.
+    kind == "edited_text_file"
+        && attachment
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .is_some_and(is_instruction_file)
+}
+
+/// CLAUDE.md files and auto-memory: context Claude Code loads into sessions,
+/// not project files a session works on.
+fn is_instruction_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(name, "CLAUDE.md" | "CLAUDE.local.md")
+        || (path.contains("/.claude/projects/") && path.contains("/memory/"))
+}
+
+/// The file a JSONL line records an edit of: the `file_path` of an
+/// Edit/Write/MultiEdit/NotebookEdit call, or the `filename` of an
+/// `edited_text_file` attachment — the only trace a Bash or python edit leaves.
+pub fn edited_path(line: &str) -> Option<String> {
+    if !line.contains("file_path") && !line.contains("notebook_path") && !line.contains("edited_text_file") {
+        return None;
+    }
+    let value: JsonValue = serde_json::from_str(line.trim()).ok()?;
+    if value.get("type").and_then(|v| v.as_str()) == Some("attachment") {
+        let a = value.get("attachment")?;
+        if a.get("type").and_then(|t| t.as_str()) != Some("edited_text_file") {
+            return None;
+        }
+        return a.get("filename").and_then(|f| f.as_str()).map(str::to_string);
+    }
+    let blocks = value.get("message")?.get("content")?.as_array()?;
+    blocks.iter().find_map(|b| {
+        if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            return None;
+        }
+        let name = b.get("name").and_then(|n| n.as_str())?;
+        if !matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+            return None;
+        }
+        let input = b.get("input")?;
+        input
+            .get("file_path")
+            .or_else(|| input.get("notebook_path"))
+            .and_then(|f| f.as_str())
+            .map(str::to_string)
+    })
 }
 
 /// [`is_boilerplate_record`] for a raw JSONL line, cheap for every other line:
@@ -236,6 +287,17 @@ pub fn classify_line(line: &str) -> String {
                 };
             }
         }
+    }
+    if msg_type == "attachment"
+        && obj
+            .get("attachment")
+            .and_then(|a| a.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("edited_text_file")
+    {
+        // The file changed on disk — usually this session's own Bash/python
+        // edit, which leaves no Edit tool call behind. "attachment" said nothing.
+        return "edited".into();
     }
     msg_type.to_string()
 }
@@ -416,7 +478,28 @@ pub fn last_message_time_ms(data: &[u8]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_session_title, extract_text, is_boilerplate_line};
+    use super::{classify_line, edited_path, extract_session_title, extract_text, is_boilerplate_line};
+
+    #[test]
+    fn edits_are_recognised_whoever_made_them() {
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/p/src/a.rs","old_string":"x","new_string":"y"}}]}}"#;
+        let bash_edit = r#"{"type":"attachment","attachment":{"type":"edited_text_file","filename":"/p/src/b.rs","snippet":"1\tfn b() {}"}}"#;
+        let read = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/p/src/a.rs"}}]}}"#;
+        assert_eq!(edited_path(tool).as_deref(), Some("/p/src/a.rs"));
+        assert_eq!(edited_path(bash_edit).as_deref(), Some("/p/src/b.rs"));
+        assert_eq!(edited_path(read), None, "reading a file is not editing it");
+        assert_eq!(classify_line(bash_edit), "edited");
+    }
+
+    #[test]
+    fn instruction_file_edit_broadcasts_are_boilerplate() {
+        let memory = r#"{"type":"attachment","attachment":{"type":"edited_text_file","filename":"/Users/x/.claude/projects/-p/memory/MEMORY.md","snippet":"- rule"}}"#;
+        let claude_md = r#"{"type":"attachment","attachment":{"type":"edited_text_file","filename":"/Users/x/.claude/CLAUDE.md","snippet":"- rule"}}"#;
+        let source = r#"{"type":"attachment","attachment":{"type":"edited_text_file","filename":"/p/src/main.rs","snippet":"fn main"}}"#;
+        assert!(is_boilerplate_line(memory));
+        assert!(is_boilerplate_line(claude_md));
+        assert!(!is_boilerplate_line(source), "a project file edit is this session's work");
+    }
 
     #[test]
     fn boilerplate_attachments_are_not_indexed_but_session_ones_are() {

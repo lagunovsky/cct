@@ -27,6 +27,9 @@ pub enum Mention {
     Bare,
     /// `index/search.rs` or longer — this file.
     Qualified,
+    /// The session changed the file: an Edit/Write call on it, or the
+    /// `edited_text_file` record a Bash or python edit leaves behind.
+    Edited,
 }
 
 impl PathQuery {
@@ -58,6 +61,21 @@ impl PathQuery {
         Some(Self {
             basename,
             qualified,
+        })
+    }
+
+    /// True when `path` — the target of an edit — is this file rather than a
+    /// namesake. With a qualified form in hand the edited path must end with
+    /// it; for a bare filename the basename has to match exactly.
+    pub fn is_same_file(&self, path: &str) -> bool {
+        let lower = path.to_lowercase();
+        if self.qualified.is_empty() {
+            let name = lower.rsplit('/').next().unwrap_or(&lower);
+            return name == self.basename.to_lowercase();
+        }
+        self.qualified.iter().any(|form| {
+            let form = form.to_lowercase();
+            lower == form || lower.ends_with(&format!("/{form}"))
         })
     }
 
@@ -142,6 +160,24 @@ mod tests {
         );
         assert_eq!(q.classify("touched index/search.rs"), Mention::Qualified);
         assert_eq!(q.classify("search.rs got slower"), Mention::Bare);
+    }
+
+    #[test]
+    fn an_edit_counts_only_for_this_file() {
+        let q = query("src/index/search.rs");
+        assert!(q.is_same_file("/Users/x/cct/src/index/search.rs"));
+        assert!(!q.is_same_file("/Users/x/cct/src/other/search.rs"), "a namesake elsewhere");
+        assert!(!q.is_same_file("/Users/x/cct/src/index/research.rs"));
+
+        // A filename that does not exist here stays bare: any file of that
+        // name counts. (An existing one resolves to its absolute path, and
+        // only edits to that very file count.)
+        let bare = query("NoSuchFile.toml");
+        assert!(bare.is_same_file("/Users/x/any/NoSuchFile.toml"));
+        assert!(!bare.is_same_file("/Users/x/any/NoSuchFile.toml.bak"));
+        let here = query("Cargo.toml");
+        assert!(!here.is_same_file("/Users/x/elsewhere/Cargo.toml"));
+        assert!(Mention::Edited > Mention::Qualified);
     }
 
     #[test]

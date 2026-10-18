@@ -14,8 +14,8 @@ use tantivy::{Index, TantivyDocument, Term};
 use crate::path_codec::parse_file_path;
 use crate::term::{fmt_size, highlight, CYAN, DIM, GRAY, RESET};
 use crate::text::{
-    classify_line, extract_top_level_timestamp_ms, find_json_values, is_boilerplate_line,
-    is_meta_content, rewrite_slash_command,
+    classify_line, edited_path, extract_top_level_timestamp_ms, find_json_values,
+    is_boilerplate_line, is_meta_content, rewrite_slash_command,
 };
 
 use super::build::{read_file_range, stored_string, stored_u64};
@@ -133,6 +133,10 @@ pub struct SessionResult {
     /// Relevance before the age damping, summed over the query strings.
     /// Meaningless across searches — only the order within one is.
     pub score: f32,
+    /// Files this session edited whose path matched the query: from Edit/Write
+    /// calls and from `edited_text_file`, which is what a Bash or python edit
+    /// leaves behind. What `blame` uses to tell "changed it" from "talked about it".
+    pub edited_paths: BTreeSet<String>,
 }
 
 pub fn select_indexes(mode: SearchMode, query: &str) -> Vec<IndexKind> {
@@ -344,6 +348,7 @@ fn merge_session_meta(into: &mut SessionResult, add: SessionResult) {
     // AND-ed query strings: a session that matched both well ranks above one
     // that scraped through on the second string.
     into.score += add.score;
+    into.edited_paths.extend(add.edited_paths);
     into.archived |= add.archived;
     if into.title.is_none() {
         into.title = add.title;
@@ -453,6 +458,7 @@ fn build_session_results(
         let FileScan {
             snippets: file_snippets,
             match_lines,
+            edited_paths,
         } = scan;
         let (session_id, project, source) = parse_file_path(&path);
         let relevance = file_relevance(&hits, &source, match_lines);
@@ -469,8 +475,10 @@ fn build_session_results(
                 title: None,
                 archived: false,
                 score: 0.0,
+                edited_paths: BTreeSet::new(),
             });
         entry.sources.insert(source);
+        entry.edited_paths.extend(edited_paths);
         // Raw sum here; the ln() lands once per session in `finish_scores`.
         entry.score += relevance;
         entry.archived |= !path.exists() && crate::archive::is_archived(&path);
@@ -584,6 +592,8 @@ fn apply_catalog_display_stats(
 pub struct FileScan {
     pub snippets: Vec<Snippet>,
     pub match_lines: u32,
+    /// Paths edited on matched lines, when the match is in the path itself.
+    pub edited_paths: BTreeSet<String>,
 }
 
 /// Ceiling on counted lines per file. A session that mentions the query 300
@@ -660,6 +670,7 @@ fn snippets_for_hits(
 ) -> FileScan {
     let mut out = Vec::new();
     let mut match_lines = 0u32;
+    let mut edited_paths = BTreeSet::new();
     let mut seen_lines = BTreeSet::new();
     let needles: Vec<String> = if fuzzy {
         let mut tokens: Vec<String> = query
@@ -768,6 +779,12 @@ fn snippets_for_hits(
                 continue;
             }
             match_lines += 1;
+            if let Some(edited) = edited_path(line) {
+                let lower_path = edited.to_lowercase();
+                if needle_variants.iter().flatten().any(|n| lower_path.contains(n.as_str())) {
+                    edited_paths.insert(edited);
+                }
+            }
             if budget == 0 {
                 if match_lines >= MATCH_LINE_CAP {
                     break;
@@ -806,6 +823,7 @@ fn snippets_for_hits(
     FileScan {
         snippets: out,
         match_lines,
+        edited_paths,
     }
 }
 
@@ -1338,6 +1356,7 @@ mod tests {
             title: Some("my-session".to_string()),
             archived: true,
             score: 1.25,
+            edited_paths: BTreeSet::new(),
         }
     }
 

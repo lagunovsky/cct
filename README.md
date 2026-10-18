@@ -227,16 +227,27 @@ discussed" but "which sessions worked on this file, and what did they say".
 ```sh
 cct blame src/index/search.rs      # sessions in the current project
 cct blame -g Cargo.toml            # across all projects
-cct blame --json src/cli.rs        # one object per session, plus "mention"
+cct blame --json src/cli.rs        # one object per session, plus "mention": edited|qualified|bare
 ```
 
 The index knows nothing about which files a session touched — transcripts
 mention paths as ordinary text — so blame searches for the basename and then
-verifies every hit. A session that wrote `src/index/search.rs` (or any longer
-tail like `index/search.rs`) is a *qualified* mention and ranks above one that
-only wrote `search.rs`; a session where the name occurs inside a longer word
-(`research.rsync`) is dropped. Within each tier the normal relevance order
-applies.
+verifies every hit, in three tiers:
+
+1. **edited** — the session changed the file: an `Edit`/`Write`/`MultiEdit`
+   call on it, or an `edited_text_file` record. The latter is what Claude Code
+   writes when a file the session has seen changes on disk, and it is the only
+   trace a Bash, sed or python edit leaves — 45% of all such records are the
+   session's own Bash edits. These sessions print an `edited <path>` line, and
+   the record shows up as an `[edited]` snippet.
+2. **qualified** — the session wrote `src/index/search.rs` or a longer tail.
+3. **bare** — only `search.rs`; a name inside a longer word (`research.rsync`)
+   is dropped.
+
+Within each tier the normal relevance order applies. An `edited_text_file` for
+CLAUDE.md or an auto-memory file is not indexed: Claude Code broadcasts it into
+every session open at the time (20 sessions for one MEMORY.md change), and the
+session that made the edit shows it through its own `Edit`/`Write` call.
 
 An existing path is resolved against the filesystem, so `cct blame ./cli.rs`
 and `cct blame src/cli.rs` behave the same. A path that no longer exists still

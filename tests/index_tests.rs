@@ -1484,3 +1484,45 @@ fn memory_attachments_do_not_make_every_session_match() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn edits_by_python_script_and_by_edit_tool_are_both_recorded() -> Result<()> {
+    let fx = Fixture::new()?;
+    let target = "/work/app/src/pricing.ts";
+    // The python route: a Bash call, then the attachment Claude Code writes
+    // when it notices the file changed on disk. No Edit call anywhere.
+    let bash = r#"{"type":"assistant","timestamp":"2026-10-01T12:00:00Z","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"python3 fix.py"}}]}}"#;
+    let edited = format!(
+        r#"{{"type":"attachment","timestamp":"2026-10-01T12:00:01Z","attachment":{{"type":"edited_text_file","filename":"{target}","snippet":"1\texport const rate = 2;"}}}}"#
+    );
+    fx.write_session("session-python", &format!("{bash}\n{edited}\n"));
+    let edit_call = format!(
+        r#"{{"type":"assistant","timestamp":"2026-10-01T12:00:00Z","message":{{"content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"{target}","old_string":"1","new_string":"2"}}}}]}}}}"#
+    );
+    fx.write_session("session-tool", &format!("{edit_call}\n"));
+    fx.write_session(
+        "session-talk",
+        &format!("{}\n", jsonl_user("should we touch /work/app/src/pricing.ts at all?")),
+    );
+    fx.full_reindex()?;
+
+    let hits = fx.search("pricing.ts", SearchMode::Auto);
+    let edited_by = |id: &str| -> BTreeSet<String> {
+        hits.iter()
+            .find(|s| s.session_id == id)
+            .map(|s| s.edited_paths.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(edited_by("session-python"), BTreeSet::from([target.to_string()]));
+    assert_eq!(edited_by("session-tool"), BTreeSet::from([target.to_string()]));
+    assert_session(&hits, "session-talk");
+    assert!(edited_by("session-talk").is_empty(), "talking about a file is not editing it");
+
+    let python = hits.iter().find(|s| s.session_id == "session-python").unwrap();
+    assert!(
+        python.snippets.iter().any(|s| s.tag == "edited"),
+        "the attachment should read as an edit: {:?}",
+        python.snippets
+    );
+    Ok(())
+}
