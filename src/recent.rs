@@ -15,6 +15,8 @@ use crate::text::{is_meta_content, last_message_time_ms, rewrite_slash_command};
 
 pub struct RecentOptions {
     pub limit: usize,
+    /// Include headless sessions (`claude -p`); see `fs_scan::is_headless`.
+    pub headless: bool,
 }
 
 #[derive(Clone)]
@@ -59,11 +61,24 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
         return Ok(());
     }
     files.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
-    let limit = opts.limit.min(files.len());
+    // Newest first, so only the logs that could make the list get their head
+    // read for the entrypoint.
+    let shown: Vec<&(PathBuf, i64)> = files
+        .iter()
+        .filter(|(path, _)| opts.headless || !crate::fs_scan::is_headless(path, None))
+        .take(opts.limit)
+        .collect();
+    if shown.is_empty() {
+        println!(
+            "\n{DIM}Only headless sessions in {} — `cct recent --headless` lists them{RESET}",
+            sessions_dir.display()
+        );
+        return Ok(());
+    }
 
     println!("{BOLD}Recent sessions in:{RESET} {cwd_str}");
 
-    for (path, mtime_ms) in files.iter().take(limit) {
+    for (path, mtime_ms) in shown {
         let session_id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())

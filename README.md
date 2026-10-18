@@ -331,7 +331,7 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 |---------|-------------|
 | `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--json`, `--mode`, `--sort`, `--headless`, `--no-update` |
 | `cct blame <path>` | Which sessions discussed a file, and what they said; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `--json`, `--headless`, `--no-update` |
-| `cct recent` | Recent sessions in cwd; flag: `-n` |
+| `cct recent` | Recent sessions in cwd (headless ones only with `--headless`); flags: `-n`, `--headless` |
 | `cct reindex` | Rebuild the Tantivy index from scratch |
 | `cct update` | Incremental update (auto on each search; manual when scripted) |
 | `cct compact` | Merge Tantivy segments to `--target-segments` (default 1) |

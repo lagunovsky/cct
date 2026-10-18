@@ -27,8 +27,14 @@ use crate::text::extract_text;
 
 pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
     match cmd {
-        None => show_recent_sessions(RecentOptions { limit: 20 }),
-        Some(cli::Cmd::Recent(args)) => show_recent_sessions(RecentOptions { limit: args.limit }),
+        None => show_recent_sessions(RecentOptions {
+            limit: 20,
+            headless: false,
+        }),
+        Some(cli::Cmd::Recent(args)) => show_recent_sessions(RecentOptions {
+            limit: args.limit,
+            headless: args.headless,
+        }),
         Some(cli::Cmd::Search(args)) => run_search(args),
         Some(cli::Cmd::Blame(args)) => run_blame(args),
         Some(cli::Cmd::Reindex(args)) => run_reindex(args),

@@ -127,6 +127,10 @@ pub struct RecentCmd {
     /// Max sessions to show.
     #[arg(short = 'n', long = "limit", default_value_t = 20)]
     pub limit: usize,
+
+    /// Include headless sessions (`claude -p`, Agent SDK), left out by default.
+    #[arg(long = "headless", default_value_t = false)]
+    pub headless: bool,
 }
 
 #[derive(Args, Debug)]
