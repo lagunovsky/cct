@@ -50,6 +50,28 @@ pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
 }
 
 fn run_archive_cmd(args: cli::ArchiveCmd) -> Result<()> {
+    if let Some(auto) = args.auto_headless.as_deref() {
+        if auto == "off" {
+            let path = crate::config::set_auto_archive_headless("off")?;
+            println!(
+                "Headless sessions now follow the general archiving age ({}).",
+                path.display()
+            );
+        } else {
+            let days = crate::archive::parse_age_days(auto)?;
+            let path = crate::config::set_auto_archive_headless(auto)?;
+            println!(
+                "Background archiving: the daemon will archive headless sessions older than {days} days ({}).",
+                path.display()
+            );
+            if !crate::daemon::daemon_installed() {
+                println!("{DIM}Note: the daemon is not installed — run `cct daemon install`.{RESET}");
+            }
+        }
+        if args.auto.is_none() {
+            return Ok(());
+        }
+    }
     if let Some(auto) = args.auto.as_deref() {
         if auto == "off" {
             let path = crate::config::set_auto_archive("off")?;
@@ -67,7 +89,16 @@ fn run_archive_cmd(args: cli::ArchiveCmd) -> Result<()> {
         }
         return Ok(());
     }
-    let older_than_days = crate::archive::parse_age_days(&args.older_than)?;
+    let headless_older_than_days = args
+        .headless_older_than
+        .as_deref()
+        .map(crate::archive::parse_age_days)
+        .transpose()?;
+    let older_than_days = match args.older_than.as_deref() {
+        Some(age) => Some(crate::archive::parse_age_days(age)?),
+        None if headless_older_than_days.is_some() => None,
+        None => Some(90),
+    };
     let project = args
         .project
         .as_deref()
@@ -87,6 +118,7 @@ fn run_archive_cmd(args: cli::ArchiveCmd) -> Result<()> {
     };
     crate::archive::run_archive(crate::archive::ArchiveOptions {
         older_than_days,
+        headless_older_than_days,
         project,
         dry_run: args.dry_run,
         skip_confirm: args.yes,
@@ -373,6 +405,7 @@ pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
         // Relevance already damps by age; blame re-sorts by how specifically
         // each session named the file, keeping this order within each tier.
         sort: search::SortBy::Relevance,
+        headless: args.headless,
     };
     let mut sessions = search::run_search(&index_dir, &opts)?;
     sp.stop();
@@ -595,6 +628,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         project_prefix: project_prefix.clone(),
         fuzzy: args.fuzzy,
         sort,
+        headless: args.headless,
     };
     let search_start = Instant::now();
     let mut sessions = search::run_search(&index_dir, &opts)?;

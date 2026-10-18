@@ -105,6 +105,7 @@ impl Fixture {
             project_prefix: None,
             fuzzy: false,
             sort: SortBy::default(),
+            headless: false,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -118,6 +119,7 @@ impl Fixture {
             project_prefix: None,
             fuzzy: false,
             sort,
+            headless: false,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -131,6 +133,7 @@ impl Fixture {
             project_prefix: None,
             fuzzy: false,
             sort: SortBy::default(),
+            headless: false,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -144,6 +147,7 @@ impl Fixture {
             project_prefix: None,
             fuzzy: true,
             sort: SortBy::default(),
+            headless: false,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -690,6 +694,7 @@ fn short_pathish_query_still_searches_word_index() -> Result<()> {
         project_prefix: None,
         fuzzy: false,
         sort: SortBy::default(),
+        headless: false,
     };
     let results = run_search(&fx.index_dir, &opts)?;
     assert_session(&results, "session-short");
@@ -915,6 +920,7 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
         project_prefix: Some(fx.project_dir.clone()),
         fuzzy: false,
         sort: SortBy::default(),
+        headless: false,
     };
     let results = run_search(&fx.index_dir, &opts)?;
     assert_session(&results, "session-scoped");
@@ -946,6 +952,7 @@ fn search_reports_incompatible_catalog() -> Result<()> {
         project_prefix: None,
         fuzzy: false,
         sort: SortBy::default(),
+        headless: false,
     };
     let err = run_search(&fx.index_dir, &opts).expect_err("catalog schema must be strict");
     let message = format!("{err:#}");
@@ -1071,7 +1078,8 @@ fn full_reindex_includes_archived_sessions() -> Result<()> {
     let archive = fx.source.parent().unwrap().join("archive");
     cct::archive::run_archive_in(
         cct::archive::ArchiveOptions {
-            older_than_days: 0,
+            older_than_days: Some(0),
+            headless_older_than_days: None,
             project: None,
             dry_run: false,
             skip_confirm: true,
@@ -1536,6 +1544,7 @@ fn search_limited(fx: &Fixture, queries: &[&str], limit: usize) -> Vec<SessionRe
         project_prefix: None,
         fuzzy: false,
         sort: SortBy::default(),
+        headless: false,
     };
     run_search(&fx.index_dir, &opts).unwrap()
 }
@@ -1582,5 +1591,63 @@ fn and_across_strings_sees_every_hit_not_the_best_few() -> Result<()> {
     fx.full_reindex()?;
     let results = search_limited(&fx, &["alphaword", "betaword"], 1);
     assert_session(&results, "session-both");
+    Ok(())
+}
+
+fn jsonl_entry(entrypoint: &str, text: &str) -> String {
+    format!(
+        r#"{{"type":"user","entrypoint":"{entrypoint}","timestamp":"2026-01-15T12:00:00Z","message":{{"content":"{text}"}}}}"#
+    )
+}
+
+fn search_headless(fx: &Fixture, query: &str, headless: bool) -> Vec<SessionResult> {
+    let opts = SearchOptions {
+        queries: vec![query.to_string()],
+        mode: SearchMode::Auto,
+        limit: 20,
+        context_chars: 80,
+        project_prefix: None,
+        fuzzy: false,
+        sort: SortBy::default(),
+        headless,
+    };
+    run_search(&fx.index_dir, &opts).unwrap()
+}
+
+#[test]
+fn headless_sessions_are_found_only_when_asked() -> Result<()> {
+    let fx = Fixture::new()?;
+    // The queued prompt comes before the first entrypoint, as in a real
+    // `claude -p` log; the session's tool result inherits its kind.
+    let piped = fx.write_session(
+        "session-piped",
+        &format!(
+            "{}\n{}\n",
+            r#"{"type":"queue-operation","operation":"enqueue","content":"zebrafinch"}"#,
+            jsonl_entry("sdk-cli", "zebrafinch from a pipeline")
+        ),
+    );
+    fx.write_tool_result("session-piped", "out.txt", "zebrafinch in tool output\n");
+    fx.write_session(
+        "session-typed",
+        &format!("{}\n", jsonl_entry("cli", "zebrafinch typed by hand")),
+    );
+    fx.full_reindex()?;
+
+    let ids = |results: Vec<SessionResult>| -> Vec<String> {
+        results.into_iter().map(|r| r.session_id).collect()
+    };
+    assert_eq!(ids(search_headless(&fx, "zebrafinch", false)), vec!["session-typed"]);
+    let all = ids(search_headless(&fx, "zebrafinch", true));
+    assert!(all.contains(&"session-piped".to_string()), "{all:?}");
+
+    // Lines appended later land in the delta index and stay hidden too.
+    let mut content = fs::read_to_string(&piped)?;
+    content.push_str(&jsonl_entry("sdk-cli", "okapiword appended later"));
+    content.push('\n');
+    fs::write(&piped, content)?;
+    fx.update()?;
+    assert!(search_headless(&fx, "okapiword", false).is_empty());
+    assert_session(&search_headless(&fx, "okapiword", true), "session-piped");
     Ok(())
 }

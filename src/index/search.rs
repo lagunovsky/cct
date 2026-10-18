@@ -56,6 +56,10 @@ pub struct SearchOptions {
     pub project_prefix: Option<PathBuf>,
     pub fuzzy: bool,
     pub sort: SortBy,
+    /// Include headless sessions (`claude -p`, Agent SDK). They are left out
+    /// by default: pipelines start them by the thousand, all alike, and they
+    /// would crowd out the sessions a person actually had.
+    pub headless: bool,
 }
 
 /// What decides the order of the sessions handed back.
@@ -237,7 +241,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
                 if !dir.exists() {
                     continue;
                 }
-                let rows = search_one_index(root, *kind, query, project_id.as_deref(), opts.fuzzy)
+                let rows = search_one_index(root, *kind, query, project_id.as_deref(), opts)
                     .with_context(|| {
                         format!("search {} index at {}", kind.as_str(), dir.display())
                     })?;
@@ -1202,7 +1206,7 @@ fn search_one_index(
     kind: IndexKind,
     query_text: &str,
     project_id: Option<&str>,
-    fuzzy: bool,
+    opts: &SearchOptions,
 ) -> Result<Vec<DocHit>> {
     let dir = subindex_dir(root, kind);
     let index =
@@ -1213,8 +1217,15 @@ fn search_one_index(
     let reader = index.reader()?;
     let searcher = reader.searcher();
     // A fuzzy query wants its words anywhere in the chunk, not side by side.
-    let phrase = !fuzzy && has_positions(&schema, fields.text);
-    let query = build_query(kind, &fields, query_text, project_id, phrase)?;
+    let phrase = !opts.fuzzy && has_positions(&schema, fields.text);
+    let mut query = build_query(kind, &fields, query_text, project_id, phrase)?;
+    if let (false, Some(field)) = (opts.headless, fields.headless) {
+        let term = Term::from_field_u64(field, 1);
+        query = Box::new(BooleanQuery::new(vec![
+            (Occur::Must, query),
+            (Occur::MustNot, Box::new(TermQuery::new(term, IndexRecordOption::Basic))),
+        ]));
+    }
     let all = (searcher.num_docs() as usize).max(1);
     let top = searcher.search(&query, &TopDocs::with_limit(all).order_by_score())?;
 

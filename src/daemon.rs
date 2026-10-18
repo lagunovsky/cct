@@ -109,9 +109,12 @@ pub fn run_background_update() -> Result<()> {
     )?;
     // Opt-in background archiving (`cct archive --auto <age>`). Runs after
     // the update+flush above, so archived tails are already in the main index.
-    if let Some(days) = crate::config::auto_archive_days() {
+    let days = crate::config::auto_archive_days();
+    let headless_days = crate::config::auto_archive_headless_days();
+    if days.is_some() || headless_days.is_some() {
         crate::archive::run_archive(crate::archive::ArchiveOptions {
             older_than_days: days,
+            headless_older_than_days: headless_days,
             project: None,
             dry_run: false,
             skip_confirm: true,

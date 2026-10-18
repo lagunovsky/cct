@@ -146,7 +146,13 @@ struct ColdSession {
 }
 
 pub struct ArchiveOptions {
-    pub older_than_days: u64,
+    /// Age past which a session is archived; `None` leaves interactive
+    /// sessions alone.
+    pub older_than_days: Option<u64>,
+    /// Age past which a headless session (`claude -p`) is archived — usually
+    /// much shorter: pipelines leave thousands, read once if ever. `None`
+    /// archives them by `older_than_days` like the rest.
+    pub headless_older_than_days: Option<u64>,
     /// Restrict to one project (absolute path already resolved); None = all.
     pub project: Option<PathBuf>,
     pub dry_run: bool,
@@ -162,11 +168,16 @@ pub fn run_archive(opts: ArchiveOptions) -> Result<()> {
 }
 
 pub fn run_archive_in(opts: ArchiveOptions, projects: &Path, archive: &Path) -> Result<()> {
-    let cutoff_ms = SystemTime::now()
+    let now_ms = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-        - (opts.older_than_days as i64) * 24 * 3600 * 1000;
+        .unwrap_or(0);
+    let cutoff = |days: u64| now_ms - (days as i64) * 24 * 3600 * 1000;
+    let cutoffs = Cutoffs {
+        interactive: opts.older_than_days.map(cutoff),
+        headless: opts.headless_older_than_days.or(opts.older_than_days).map(cutoff),
+    };
+    let criteria = describe_ages(&opts);
 
     let project_dirs = match &opts.project {
         Some(abs) => {
@@ -195,14 +206,11 @@ pub fn run_archive_in(opts: ArchiveOptions, projects: &Path, archive: &Path) -> 
 
     let mut cold: Vec<ColdSession> = Vec::new();
     for dir in &project_dirs {
-        collect_cold_sessions(dir, cutoff_ms, &mut cold)?;
+        collect_cold_sessions(dir, cutoffs, &mut cold)?;
     }
     if cold.is_empty() {
         if !opts.quiet {
-            println!(
-                "Nothing to archive: no sessions older than {} days.",
-                opts.older_than_days
-            );
+            println!("Nothing to archive: no sessions {criteria}.");
         }
         return Ok(());
     }
@@ -211,9 +219,8 @@ pub fn run_archive_in(opts: ArchiveOptions, projects: &Path, archive: &Path) -> 
     let total_bytes: u64 = cold.iter().map(|s| s.bytes).sum();
     if !opts.quiet {
         println!(
-            "{BOLD}Archive {} session(s) older than {} days{RESET} ({} on disk)",
+            "{BOLD}Archive {} session(s) {criteria}{RESET} ({} on disk)",
             cold.len(),
-            opts.older_than_days,
             fmt_size(total_bytes)
         );
         println!("  from: {}", projects.display());
@@ -273,9 +280,28 @@ pub fn run_archive_in(opts: ArchiveOptions, projects: &Path, archive: &Path) -> 
     Ok(())
 }
 
+/// Last-activity times before which a session is cold, by kind; `None` = never.
+#[derive(Clone, Copy)]
+struct Cutoffs {
+    interactive: Option<i64>,
+    headless: Option<i64>,
+}
+
+/// "older than 120 days", "older than 120 days (headless: 10 days)".
+fn describe_ages(opts: &ArchiveOptions) -> String {
+    match (opts.older_than_days, opts.headless_older_than_days) {
+        (Some(all), None) => format!("older than {all} days"),
+        (Some(all), Some(headless)) => {
+            format!("older than {all} days (headless: {headless} days)")
+        }
+        (None, Some(headless)) => format!("headless, older than {headless} days"),
+        (None, None) => "selected".to_string(),
+    }
+}
+
 fn collect_cold_sessions(
     project_dir: &Path,
-    cutoff_ms: i64,
+    cutoffs: Cutoffs,
     out: &mut Vec<ColdSession>,
 ) -> Result<()> {
     for entry in fs::read_dir(project_dir)
@@ -288,8 +314,21 @@ fn collect_cold_sessions(
         {
             continue;
         }
+        // The cheap check first: with no cutoff at all, or activity too
+        // recent for either, the log's head is never read.
+        let Some(loosest) = cutoffs.interactive.max(cutoffs.headless) else {
+            continue;
+        };
         let last = session_activity_time_ms(&path);
-        if last == 0 || last >= cutoff_ms {
+        if last == 0 || last >= loosest {
+            continue;
+        }
+        let cutoff = if crate::fs_scan::is_headless(&path, None) {
+            cutoffs.headless
+        } else {
+            cutoffs.interactive
+        };
+        if cutoff.is_none_or(|c| last >= c) {
             continue;
         }
         let id = path

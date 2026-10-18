@@ -40,7 +40,8 @@ impl ArchiveFixture {
 
     fn opts(days: u64) -> ArchiveOptions {
         ArchiveOptions {
-            older_than_days: days,
+            older_than_days: Some(days),
+            headless_older_than_days: None,
             project: None,
             dry_run: false,
             skip_confirm: true,
@@ -194,5 +195,39 @@ fn keep_mtime_flag_preserves_original_mtime() -> Result<()> {
         old_time.unix_seconds(),
         "--keep-mtime must carry the original mtime through archive and restore"
     );
+    Ok(())
+}
+
+#[test]
+fn headless_sessions_are_archived_by_their_own_age() -> Result<()> {
+    let fx = ArchiveFixture::new()?;
+    let twenty_days_ago = (chrono::Utc::now() - chrono::Duration::days(20)).to_rfc3339();
+    let typed = fx.write_session("-proj", "typed-session", &twenty_days_ago);
+    let piped = fx.projects.join("-proj").join("piped-session.jsonl");
+    fs::write(
+        &piped,
+        format!(
+            "{{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"timestamp\":\"{twenty_days_ago}\",\"message\":{{\"content\":\"p\"}}}}\n"
+        ),
+    )?;
+
+    // Headless only: interactive sessions are not touched at any age.
+    let opts = ArchiveOptions {
+        older_than_days: None,
+        headless_older_than_days: Some(10),
+        ..ArchiveFixture::opts(0)
+    };
+    run_archive_in(opts, &fx.projects, &fx.archive)?;
+    assert!(!piped.exists(), "a 20-day-old headless session is past 10 days");
+    assert!(typed.exists(), "interactive sessions have no age set");
+
+    // Both ages: the interactive one waits for its own.
+    let opts = ArchiveOptions {
+        older_than_days: Some(30),
+        headless_older_than_days: Some(10),
+        ..ArchiveFixture::opts(0)
+    };
+    run_archive_in(opts, &fx.projects, &fx.archive)?;
+    assert!(typed.exists(), "20 days is under the 30-day age");
     Ok(())
 }

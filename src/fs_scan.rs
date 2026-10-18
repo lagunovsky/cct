@@ -1,8 +1,10 @@
 //! Discovery of Claude Code project files: sessions, subagent logs, text-like tool results.
 
+use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Context, Result};
@@ -22,6 +24,74 @@ impl FileKind {
             FileKind::SessionJsonl => "session_jsonl",
             FileKind::SubagentJsonl => "subagent_jsonl",
             FileKind::ToolResult => "tool_result",
+        }
+    }
+}
+
+/// How far into a session log to look for its entrypoint. It is on the first
+/// user or assistant record; before that come only a few small ones and, for
+/// a headless session, the queued prompt.
+const ENTRYPOINT_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The session log a file belongs to: itself, or `<project>/<session>.jsonl`
+/// for a subagent log or tool result under `<project>/<session>/…/`.
+pub fn owning_session_log(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    match parent.file_name().and_then(|n| n.to_str()) {
+        Some("subagents" | "tool-results") => {
+            let session_dir = parent.parent()?;
+            let id = session_dir.file_name()?.to_string_lossy().into_owned();
+            Some(session_dir.parent()?.join(format!("{id}.jsonl")))
+        }
+        _ => Some(path.to_path_buf()),
+    }
+}
+
+/// True for a file of a headless session (`claude -p`, the Agent SDK) — see
+/// [`crate::text::headless_entrypoint`]. Subagent logs and tool results take
+/// it from their session. `data` is the file's content when the caller already
+/// has it; otherwise the session log is read up to its first entrypoint, from
+/// the live file or the archive. Cached per session: a full reindex asks once
+/// for every subagent log and tool result. A log with no entrypoint yet (just
+/// created) counts as interactive and is not cached.
+pub fn is_headless(path: &Path, data: Option<&[u8]>) -> bool {
+    let Some(log) = owning_session_log(path) else {
+        return false;
+    };
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache.lock().ok().and_then(|c| c.get(&log).copied()) {
+        return known;
+    }
+    let found = match data.filter(|_| log == path) {
+        Some(data) => data
+            .split(|b| *b == b'\n')
+            .find_map(crate::text::headless_entrypoint),
+        None => scan_entrypoint(&log),
+    };
+    if let (Some(headless), Ok(mut c)) = (found, cache.lock()) {
+        c.insert(log, headless);
+    }
+    found.unwrap_or(false)
+}
+
+fn scan_entrypoint(log: &Path) -> Option<bool> {
+    let reader: Box<dyn Read> = match fs::File::open(log) {
+        Ok(f) => Box::new(f),
+        Err(_) => {
+            let zst = fs::File::open(crate::archive::archive_path_for(log)?).ok()?;
+            Box::new(zstd::stream::read::Decoder::new(zst).ok()?)
+        }
+    };
+    let mut reader = BufReader::new(reader.take(ENTRYPOINT_SCAN_BYTES));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).ok()? == 0 {
+            return None;
+        }
+        if let Some(headless) = crate::text::headless_entrypoint(&line) {
+            return Some(headless);
         }
     }
 }

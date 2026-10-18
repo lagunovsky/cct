@@ -16,6 +16,7 @@ pub const CLEANUP_WARN_THRESHOLD_DAYS: u64 = 90;
 
 const CLEANUP_WARNING_KEY: &str = "cleanup_warning";
 const AUTO_ARCHIVE_KEY: &str = "auto_archive";
+const AUTO_ARCHIVE_HEADLESS_KEY: &str = "auto_archive_headless";
 
 pub fn config_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
@@ -89,7 +90,11 @@ pub fn auto_archive_days() -> Option<u64> {
 }
 
 fn auto_archive_days_from(map: &BTreeMap<String, String>) -> Option<u64> {
-    let raw = map.get(AUTO_ARCHIVE_KEY)?;
+    age_days_at(map, AUTO_ARCHIVE_KEY)
+}
+
+fn age_days_at(map: &BTreeMap<String, String>, key: &str) -> Option<u64> {
+    let raw = map.get(key)?;
     if raw == "off" {
         return None;
     }
@@ -98,6 +103,16 @@ fn auto_archive_days_from(map: &BTreeMap<String, String>) -> Option<u64> {
 
 pub fn set_auto_archive(raw: &str) -> Result<PathBuf> {
     set_config_value(AUTO_ARCHIVE_KEY, raw)
+}
+
+/// Background-archiving age for headless sessions (`claude -p`); None = they
+/// follow [`auto_archive_days`]. Set via `cct archive --auto-headless 10d`.
+pub fn auto_archive_headless_days() -> Option<u64> {
+    age_days_at(&read_config(), AUTO_ARCHIVE_HEADLESS_KEY)
+}
+
+pub fn set_auto_archive_headless(raw: &str) -> Result<PathBuf> {
+    set_config_value(AUTO_ARCHIVE_HEADLESS_KEY, raw)
 }
 
 pub fn claude_settings_path() -> Result<PathBuf> {

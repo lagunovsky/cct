@@ -204,6 +204,10 @@ pub struct Fields {
     pub start_offset: Field,
     pub end_offset: Field,
     pub text: Field,
+    /// Set to 1 on every doc of a headless session (`claude -p`), absent
+    /// otherwise; search leaves those out unless asked. `None` in an index
+    /// built before the field existed.
+    pub headless: Option<Field>,
 }
 
 pub fn schema_and_fields(kind: IndexKind) -> (Schema, Fields) {
@@ -214,6 +218,7 @@ pub fn schema_and_fields(kind: IndexKind) -> (Schema, Fields) {
     let path = builder.add_text_field("path", TextOptions::default().set_stored());
     let start_offset = builder.add_u64_field("start_offset", STORED);
     let end_offset = builder.add_u64_field("end_offset", STORED);
+    let headless = builder.add_u64_field("headless", INDEXED);
     let text_indexing = TextFieldIndexing::default()
         .set_tokenizer(kind.tokenizer())
         .set_index_option(kind.record_option());
@@ -231,6 +236,7 @@ pub fn schema_and_fields(kind: IndexKind) -> (Schema, Fields) {
             start_offset,
             end_offset,
             text,
+            headless: Some(headless),
         },
     )
 }
@@ -244,6 +250,7 @@ pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
         start_offset: schema.get_field("start_offset")?,
         end_offset: schema.get_field("end_offset")?,
         text: schema.get_field("text")?,
+        headless: schema.get_field("headless").ok(),
     })
 }
 

@@ -628,6 +628,7 @@ pub fn flush_delta(index_dir: &Path, config: WriterConfig, verbose: bool) -> Res
             0,
             &path_string,
             &project_id,
+            crate::fs_scan::is_headless(&entry.path, None),
         )?;
     }
     commit_targets("main", targets, verbose)?;

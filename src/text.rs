@@ -177,6 +177,17 @@ pub fn edited_path(line: &str) -> Option<String> {
     })
 }
 
+/// Whether a session was started headless — `claude -p` or the Agent SDK — from
+/// a line of its log: the `entrypoint` Claude Code stamps on every user and
+/// assistant record is `sdk-…` then, and `cli` for an interactive session.
+/// `None` for a line without one. Matched on raw bytes: inside a message the
+/// key would be JSON-escaped and not match.
+pub fn headless_entrypoint(line: &[u8]) -> Option<bool> {
+    const KEY: &[u8] = b"\"entrypoint\":\"";
+    let at = line.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    Some(line[at..].starts_with(b"sdk"))
+}
+
 /// [`is_boilerplate_record`] for a raw JSONL line, cheap for every other line:
 /// only lines that mention an attachment or a duplicate record are parsed.
 pub fn is_boilerplate_line(line: &str) -> bool {

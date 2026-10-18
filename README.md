@@ -178,6 +178,13 @@ are AND-ed over every index hit, not over each string's best few.
 `--sort time` restores the old behaviour — newest session first, regardless of
 match quality. `--json` reports the pre-damping score per session.
 
+Headless sessions — `claude -p` and the Agent SDK, which Claude Code marks
+with `"entrypoint":"sdk-cli"` — are indexed but left out of `search` and
+`blame` unless `--headless` is passed. Review pipelines start them by the
+thousand from one prompt template, and they crowded the sessions a person
+actually had out of the results. Subagent logs and tool results follow their
+session.
+
 Multi-word queries are matched as a phrase on one line by default.
 Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets
 even when the full phrase never appears on a single line.
@@ -322,8 +329,8 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 
 | Command | Description |
 |---------|-------------|
-| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--json`, `--mode`, `--sort`, `--no-update` |
-| `cct blame <path>` | Which sessions discussed a file, and what they said; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `--json`, `--no-update` |
+| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--json`, `--mode`, `--sort`, `--headless`, `--no-update` |
+| `cct blame <path>` | Which sessions discussed a file, and what they said; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `--json`, `--headless`, `--no-update` |
 | `cct recent` | Recent sessions in cwd; flag: `-n` |
 | `cct reindex` | Rebuild the Tantivy index from scratch |
 | `cct update` | Incremental update (auto on each search; manual when scripted) |
@@ -334,7 +341,7 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 | `cct daemon uninstall` | Remove launchd job |
 | `cct daemon update` | Background update entry point used by launchd |
 | `cct cleanup-period [days]` | Show or set Claude Code's transcript retention (`cleanupPeriodDays` in `~/.claude/settings.json`); flags: `--no-warn`, `--warn` |
-| `cct archive` | Move cold sessions into `~/.claude/archive` (zstd); flags: `--older-than` (default 90d), `-p`, `--dry-run`, `-y`, `--auto <age\|off>` |
+| `cct archive` | Move cold sessions into `~/.claude/archive` (zstd); flags: `--older-than` (default 90d), `--headless-older-than`, `-p`, `--dry-run`, `-y`, `--auto <age\|off>`, `--auto-headless <age\|off>` |
 | `cct unarchive <ids...>` | Restore archived sessions back into `~/.claude/projects`; flag: `--keep-mtime` |
 
 ## Archiving
@@ -352,7 +359,10 @@ preserve the original timestamp instead — at your own cleanup risk).
 Background archiving is opt-in: `cct archive --auto 90d` makes the launchd
 daemon archive cold sessions after each background index update
 (`cct archive --auto off` disables; the setting lives in
-`~/.config/cct/config`).
+`~/.config/cct/config`). `cct archive --auto-headless 10d` gives headless
+sessions their own, shorter age (`off` makes them follow `--auto` again);
+`--headless-older-than 10d` does the same for a manual run, and on its own
+archives headless sessions only.
 
 Limitations: archived sessions don't appear in `cct recent` or the transfer
 picker, and `cct rename`/`cct transfer` skip them — unarchive first.

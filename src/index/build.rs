@@ -282,8 +282,9 @@ pub fn add_whole_file(
         path: file.path.clone(),
     };
 
+    let headless = crate::fs_scan::is_headless(&file.path, Some(&data));
     for target in targets.iter_mut().filter(|t| t.kind == IndexKind::Path) {
-        add_path_document(target, &entry, &path_string, &project_id)?;
+        add_path_document(target, &entry, &path_string, &project_id, headless)?;
     }
 
     let content = add_content_bytes(
@@ -293,6 +294,7 @@ pub fn add_whole_file(
         0,
         &path_string,
         &project_id,
+        headless,
     )?;
     if content.stats_available {
         set_entry_display_stats(&mut entry, &file.path, content.stats);
@@ -351,6 +353,7 @@ pub fn append_file_tail(
         start,
         &path_string,
         &project_id,
+        crate::fs_scan::is_headless(&file.path, None),
     )?;
     if content.stats_available {
         append_entry_display_stats(entry, &file.path, content.stats, file.size);
@@ -391,6 +394,7 @@ pub fn add_content_bytes(
     base_offset: u64,
     path_string: &str,
     project_id: &str,
+    headless: bool,
 ) -> Result<ContentAddResult> {
     let mut content_targets: Vec<&mut BuildTarget> = targets
         .iter_mut()
@@ -428,6 +432,7 @@ pub fn add_content_bytes(
             document.add_u64(target.fields.start_offset, start_offset);
             document.add_u64(target.fields.end_offset, end_offset);
             document.add_text(target.fields.text, &text);
+            mark_headless(&mut document, &target.fields, headless);
             target.writer.add_document(document)?;
         }
         chunks_added += 1;
@@ -444,6 +449,7 @@ pub fn add_path_document(
     entry: &CatalogEntry,
     path_string: &str,
     project_id: &str,
+    headless: bool,
 ) -> Result<()> {
     let mut document = TantivyDocument::new();
     document.add_u64(target.fields.file_id, entry.file_id);
@@ -453,8 +459,15 @@ pub fn add_path_document(
     document.add_u64(target.fields.start_offset, 0u64);
     document.add_u64(target.fields.end_offset, entry.size);
     document.add_text(target.fields.text, path_string);
+    mark_headless(&mut document, &target.fields, headless);
     target.writer.add_document(document)?;
     Ok(())
+}
+
+fn mark_headless(document: &mut TantivyDocument, fields: &Fields, headless: bool) {
+    if let (true, Some(field)) = (headless, fields.headless) {
+        document.add_u64(field, 1);
+    }
 }
 
 pub fn project_id_for_path(path: &Path) -> String {

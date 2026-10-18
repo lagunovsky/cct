@@ -174,6 +174,10 @@ pub struct SearchCmd {
     #[arg(long = "sort", value_enum, default_value_t = SortBy::Relevance)]
     pub sort: SortBy,
 
+    /// Include headless sessions (`claude -p`, Agent SDK), left out by default.
+    #[arg(long = "headless", default_value_t = false)]
+    pub headless: bool,
+
     /// Query strings; a session must match all of them (AND), anywhere in the
     /// session. Tokens inside one string are AND-ed in nearby context.
     #[arg(required = true, num_args = 1..)]
@@ -197,6 +201,10 @@ pub struct BlameCmd {
     /// Look across all projects (default: current directory only).
     #[arg(short, long, default_value_t = false)]
     pub global: bool,
+
+    /// Include headless sessions (`claude -p`, Agent SDK), left out by default.
+    #[arg(long = "headless", default_value_t = false)]
+    pub headless: bool,
 
     /// Restrict to a specific project path.
     #[arg(short = 'p', long = "project")]
@@ -305,9 +313,14 @@ pub struct TransferCmd {
 
 #[derive(Args, Debug)]
 pub struct ArchiveCmd {
-    /// Archive sessions whose last activity is older than this (90d, 3m, 1y, or days).
-    #[arg(long = "older-than", default_value = "90d")]
-    pub older_than: String,
+    /// Archive sessions whose last activity is older than this (90d, 3m, 1y,
+    /// or days). Default 90d, unless only --headless-older-than is given.
+    #[arg(long = "older-than")]
+    pub older_than: Option<String>,
+
+    /// Archive headless sessions (`claude -p`) older than this instead.
+    #[arg(long = "headless-older-than", value_name = "AGE")]
+    pub headless_older_than: Option<String>,
 
     /// Restrict to one project path (default: all projects).
     #[arg(short = 'p', long = "project")]
@@ -326,6 +339,11 @@ pub struct ArchiveCmd {
     /// is archived right now.
     #[arg(long = "auto", value_name = "AGE|off")]
     pub auto: Option<String>,
+
+    /// Configure the daemon's age for headless sessions (`claude -p`): an age
+    /// (10d) to archive them sooner than the rest, or `off` to follow --auto.
+    #[arg(long = "auto-headless", value_name = "AGE|off")]
+    pub auto_headless: Option<String>,
 }
 
 #[derive(Args, Debug)]
