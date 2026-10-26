@@ -185,6 +185,25 @@ thousand from one prompt template, and they crowded the sessions a person
 actually had out of the results. Subagent logs and tool results follow their
 session.
 
+To find a place inside one session — a long one, where five snippets out of
+hundreds of matches say little — search it alone and read around the match:
+
+```sh
+cct search -s 499d80ae --since "2026-10-25 18:00" --until 2026-10-25 "запер"
+cct show 499d80ae @495579478          # the conversation around that match
+cct show 499d80ae --time "2026-10-25 19:46" -C 10
+cct show 499d80ae                     # the end of the session
+```
+
+`-s <id>` lists every match in the session oldest first, with `-n` counting
+snippets; each carries the `@location` of its line (`@<offset>` in the main
+log, `@subagents/<file>:<offset>` in a subagent log), which `-v` also prints in
+ordinary searches and `--json` returns as `at`, `file` and `offset`.
+`--since`/`--until` (a date, `"2026-10-25 18:00"`, or an age like `2h`, `3d`)
+work in any search. `cct show` prints prompts, answers, tool calls and their
+results around the point, `-C` records on each side, long ones cut unless
+`--full`.
+
 Multi-word queries are matched as a phrase on one line by default.
 Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets
 even when the full phrase never appears on a single line.
@@ -329,7 +348,8 @@ Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
 
 | Command | Description |
 |---------|-------------|
-| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `--json`, `--mode`, `--sort`, `--headless`, `--no-update` |
+| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `-s`, `--since`, `--until`, `--json`, `--mode`, `--sort`, `--headless`, `--no-update` |
+| `cct show <id> [@loc]` | Read a session around a search match, a `--time`, or its end; flags: `-C`, `--full` |
 | `cct blame <path>` | Which sessions discussed a file, and what they said; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `--json`, `--headless`, `--no-update` |
 | `cct recent` | Recent sessions in cwd (headless ones only with `--headless`); flags: `-n`, `--headless` |
 | `cct reindex` | Rebuild the Tantivy index from scratch |

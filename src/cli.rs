@@ -43,6 +43,7 @@ pub const KNOWN_SUBCOMMANDS: &[&str] = &[
     "cp",
     "archive",
     "unarchive",
+    "show",
     "help",
 ];
 
@@ -120,6 +121,30 @@ pub enum Cmd {
 
     /// Restore archived sessions back into ~/.claude/projects.
     Unarchive(UnarchiveCmd),
+
+    /// Read a session around one point: a search snippet's @location, a time, or the end.
+    Show(ShowCmd),
+}
+
+#[derive(Args, Debug)]
+pub struct ShowCmd {
+    /// Session id or unique prefix.
+    pub session: String,
+
+    /// Where: `@<offset>` or `@<file>:<offset>`, as `cct search -v` / `-s` print it.
+    pub at: Option<String>,
+
+    /// Open at the first record at or after this time (2026-10-25 18:00, 2h, 3d).
+    #[arg(long = "time", conflicts_with = "at")]
+    pub time: Option<String>,
+
+    /// Records shown before and after the point.
+    #[arg(short = 'C', long = "context", default_value_t = 6)]
+    pub context: usize,
+
+    /// Print records whole instead of truncating long ones.
+    #[arg(long = "full", default_value_t = false)]
+    pub full: bool,
 }
 
 #[derive(Args, Debug)]
@@ -181,6 +206,19 @@ pub struct SearchCmd {
     /// Include headless sessions (`claude -p`, Agent SDK), left out by default.
     #[arg(long = "headless", default_value_t = false)]
     pub headless: bool,
+
+    /// Search one session (id or unique prefix): every match, oldest first,
+    /// each with the @location `cct show` opens; -n then counts snippets.
+    #[arg(short = 's', long = "session", value_name = "ID")]
+    pub session: Option<String>,
+
+    /// Only matches at or after this time (2026-10-25, "2026-10-25 18:00", 2h, 3d).
+    #[arg(long = "since", value_name = "TIME")]
+    pub since: Option<String>,
+
+    /// Only matches at or before this time (a bare date includes its whole day).
+    #[arg(long = "until", value_name = "TIME")]
+    pub until: Option<String>,
 
     /// Query strings; a session must match all of them (AND), anywhere in the
     /// session. Tokens inside one string are AND-ed in nearby context.

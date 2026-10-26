@@ -49,6 +49,13 @@ pub fn run(cmd: Option<cli::Cmd>) -> Result<()> {
         },
         Some(cli::Cmd::CleanupPeriod(args)) => run_cleanup_period(args),
         Some(cli::Cmd::Archive(args)) => run_archive_cmd(args),
+        Some(cli::Cmd::Show(args)) => crate::show::run_show(crate::show::ShowArgs {
+            session: args.session,
+            at: args.at,
+            time: args.time,
+            context: args.context,
+            full: args.full,
+        }),
         Some(cli::Cmd::Unarchive(args)) => {
             crate::archive::run_unarchive(&args.ids, args.keep_mtime)
         }
@@ -412,6 +419,9 @@ pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
         // each session named the file, keeping this order within each tier.
         sort: search::SortBy::Relevance,
         headless: args.headless,
+        session: None,
+        since_ms: None,
+        until_ms: None,
     };
     let mut sessions = search::run_search(&index_dir, &opts)?;
     sp.stop();
@@ -453,6 +463,7 @@ pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
                 stats.tools,
                 stats.bytes,
                 args.verbose >= 1,
+                false,
             );
             value["mention"] = serde_json::json!(match mention {
                 crate::blame::Mention::Edited => "edited",
@@ -479,7 +490,7 @@ pub fn run_blame(args: cli::BlameCmd) -> Result<()> {
                 println!("  {BOLD}edited{RESET} {DIM}{path}{RESET}");
             }
         }
-        search::print_snippets(&s.snippets, &queries, args.verbose >= 1, false);
+        search::print_snippets(&s.snippets, &queries, args.verbose >= 1, false, false);
         if args.verbose >= 1 {
             for f in &s.files {
                 println!("  {DIM}{}{RESET}", f.display());
@@ -593,13 +604,43 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
     let index_dir = index_root()?;
     let source = projects_dir()?;
 
-    let resolved = resolve_project_prefix(&args)?;
+    // A session id is unique across projects: -s searches it wherever it is,
+    // headless or not.
+    let session = args
+        .session
+        .as_deref()
+        .map(|q| -> Result<String> {
+            let log = crate::show::resolve_session(q)?;
+            Ok(log
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default())
+        })
+        .transpose()?;
+    let since_ms = args
+        .since
+        .as_deref()
+        .map(|t| crate::show::parse_time_bound(t, false))
+        .transpose()?;
+    let until_ms = args
+        .until
+        .as_deref()
+        .map(|t| crate::show::parse_time_bound(t, true))
+        .transpose()?;
+    let resolved = if session.is_some() {
+        None
+    } else {
+        resolve_project_prefix(&args)?
+    };
     let project_prefix = resolved.as_ref().map(|r| r.prefix.clone());
     let project_label = resolved.as_ref().map(|r| r.label.clone());
 
     let start = Instant::now();
     if !args.json {
-        print_search_header(&query_label, &args, project_label.as_deref());
+        match &session {
+            Some(id) => println!("{BOLD}Searching for:{RESET} {query_label}  {DIM}in session {id}{RESET}"),
+            None => print_search_header(&query_label, &args, project_label.as_deref()),
+        }
     }
 
     let verbose_index = args.verbose >= 2;
@@ -634,12 +675,26 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         project_prefix: project_prefix.clone(),
         fuzzy: args.fuzzy,
         sort,
-        headless: args.headless,
+        headless: args.headless || session.is_some(),
+        session: session.clone(),
+        since_ms,
+        until_ms,
     };
+    // In one session every tier of snippet counts: the place sought may be a
+    // tool result as easily as an answer.
+    let all_tiers = args.verbose >= 1 || session.is_some();
     let search_start = Instant::now();
     let mut sessions = search::run_search(&index_dir, &opts)?;
     let search_elapsed = search_start.elapsed();
     sp.stop();
+    // In one session -n counts snippets: the earliest ones in the window.
+    let mut session_matches = 0usize;
+    if session.is_some() {
+        for s in &mut sessions {
+            session_matches = s.snippets.len();
+            s.snippets.truncate(args.limit);
+        }
+    }
 
     let render_start = Instant::now();
     if args.json {
@@ -647,9 +702,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         // Content selection matches the human renderer — -v widens snippets
         // to agent/hook matches and adds file paths — so agents opt into
         // depth instead of paying tokens for it on every search.
-        sessions.retain(|s| {
-            !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty()
-        });
+        sessions.retain(|s| !search::select_visible_snippets(&s.snippets, all_tiers).is_empty());
         let to_show = sessions.len().min(args.limit);
         let visible: Vec<&search::SessionResult> = sessions.iter().take(to_show).collect();
         let stats_per_session = compute_session_stats_parallel(&visible);
@@ -660,7 +713,12 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
                 stats.tools,
                 stats.bytes,
                 args.verbose >= 1,
+                session.is_some(),
             );
+            let mut value = value;
+            if session.is_some() {
+                value["matches"] = serde_json::json!(session_matches);
+            }
             println!("{value}");
         }
         // Same post-search index hygiene as the human path, quiet on success.
@@ -671,8 +729,7 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         }
         return Ok(());
     }
-    sessions
-        .retain(|s| !search::select_visible_snippets(&s.snippets, args.verbose >= 1).is_empty());
+    sessions.retain(|s| !search::select_visible_snippets(&s.snippets, all_tiers).is_empty());
     let total = sessions.len();
     let to_show = sessions.len().min(args.limit);
     if total == 0 {
@@ -688,12 +745,26 @@ pub fn run_search(args: cli::SearchCmd) -> Result<()> {
         let stats_per_session = compute_session_stats_parallel(&visible);
         for (s, stats) in sessions.iter_mut().take(to_show).zip(stats_per_session) {
             search::print_session_header(s, stats.prompts, stats.tools, stats.bytes);
-            search::print_snippets(&s.snippets, &queries, args.verbose >= 1, args.fuzzy);
+            search::print_snippets(&s.snippets, &queries, all_tiers, args.fuzzy, session.is_some());
             if args.verbose >= 1 {
                 for f in &s.files {
                     println!("  {DIM}{}{RESET}", f.display());
                 }
             }
+        }
+        if let Some(at) = sessions
+            .first()
+            .filter(|_| session.is_some())
+            .and_then(|s| s.snippets.first().map(|sn| (s, sn.locator())))
+        {
+            let id: String = at.0.session_id.chars().take(8).collect();
+            if session_matches > args.limit {
+                println!(
+                    "\n{DIM}Showing the first {} of {session_matches} matches — narrow with --since/--until or raise -n.{RESET}",
+                    args.limit
+                );
+            }
+            println!("\n{DIM}Read around a match: cct show {id} {}{RESET}", at.1);
         }
         if total > to_show {
             println!(

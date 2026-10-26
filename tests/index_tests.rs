@@ -106,6 +106,9 @@ impl Fixture {
             fuzzy: false,
             sort: SortBy::default(),
             headless: false,
+            session: None,
+            since_ms: None,
+            until_ms: None,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -120,6 +123,9 @@ impl Fixture {
             fuzzy: false,
             sort,
             headless: false,
+            session: None,
+            since_ms: None,
+            until_ms: None,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -134,6 +140,9 @@ impl Fixture {
             fuzzy: false,
             sort: SortBy::default(),
             headless: false,
+            session: None,
+            since_ms: None,
+            until_ms: None,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -148,6 +157,9 @@ impl Fixture {
             fuzzy: true,
             sort: SortBy::default(),
             headless: false,
+            session: None,
+            since_ms: None,
+            until_ms: None,
         };
         run_search(&self.index_dir, &opts).unwrap_or_default()
     }
@@ -695,6 +707,9 @@ fn short_pathish_query_still_searches_word_index() -> Result<()> {
         fuzzy: false,
         sort: SortBy::default(),
         headless: false,
+        session: None,
+        since_ms: None,
+        until_ms: None,
     };
     let results = run_search(&fx.index_dir, &opts)?;
     assert_session(&results, "session-short");
@@ -921,6 +936,9 @@ fn project_scope_uses_path_boundaries_not_string_prefix() -> Result<()> {
         fuzzy: false,
         sort: SortBy::default(),
         headless: false,
+        session: None,
+        since_ms: None,
+        until_ms: None,
     };
     let results = run_search(&fx.index_dir, &opts)?;
     assert_session(&results, "session-scoped");
@@ -953,6 +971,9 @@ fn search_reports_incompatible_catalog() -> Result<()> {
         fuzzy: false,
         sort: SortBy::default(),
         headless: false,
+        session: None,
+        since_ms: None,
+        until_ms: None,
     };
     let err = run_search(&fx.index_dir, &opts).expect_err("catalog schema must be strict");
     let message = format!("{err:#}");
@@ -1545,6 +1566,9 @@ fn search_limited(fx: &Fixture, queries: &[&str], limit: usize) -> Vec<SessionRe
         fuzzy: false,
         sort: SortBy::default(),
         headless: false,
+        session: None,
+        since_ms: None,
+        until_ms: None,
     };
     run_search(&fx.index_dir, &opts).unwrap()
 }
@@ -1610,6 +1634,9 @@ fn search_headless(fx: &Fixture, query: &str, headless: bool) -> Vec<SessionResu
         fuzzy: false,
         sort: SortBy::default(),
         headless,
+        session: None,
+        since_ms: None,
+        until_ms: None,
     };
     run_search(&fx.index_dir, &opts).unwrap()
 }
@@ -1649,5 +1676,52 @@ fn headless_sessions_are_found_only_when_asked() -> Result<()> {
     fx.update()?;
     assert!(search_headless(&fx, "okapiword", false).is_empty());
     assert_session(&search_headless(&fx, "okapiword", true), "session-piped");
+    Ok(())
+}
+
+#[test]
+fn one_session_lists_every_match_in_time_order_with_its_location() -> Result<()> {
+    let fx = Fixture::new()?;
+    let line = |ts: &str, text: &str| {
+        format!(r#"{{"type":"user","timestamp":"{ts}","message":{{"content":"{text}"}}}}"#)
+    };
+    let lines: Vec<String> = (0..30)
+        .map(|i| line(&format!("2026-10-25T{:02}:00:00Z", i % 24), &format!("marmotword number {i}")))
+        .collect();
+    let body = lines.join("\n") + "\n";
+    let path = fx.write_session("session-long", &body);
+    fx.write_session("session-other", &format!("{}\n", jsonl_user("marmotword elsewhere")));
+    fx.full_reindex()?;
+
+    let opts = |since_ms: Option<i64>| SearchOptions {
+        queries: vec!["marmotword".to_string()],
+        mode: SearchMode::Auto,
+        limit: 100,
+        context_chars: 40,
+        project_prefix: None,
+        fuzzy: false,
+        sort: SortBy::default(),
+        headless: false,
+        session: Some("session-long".to_string()),
+        since_ms,
+        until_ms: None,
+    };
+    let results = run_search(&fx.index_dir, &opts(None))?;
+    assert_eq!(results.len(), 1, "only the asked session");
+    let snippets = &results[0].snippets;
+    assert_eq!(snippets.len(), 30, "every match, not the per-session cap");
+    assert!(snippets.windows(2).all(|w| w[0].time_ms <= w[1].time_ms), "oldest first");
+    // The location points at the matched line itself.
+    let first = &snippets[0];
+    let at = first.offset as usize;
+    assert!(body[at..].starts_with(r#"{"type":"user""#));
+    assert!(body[at..].split('\n').next().unwrap().contains("marmotword"));
+    assert_eq!(first.file, path);
+    assert_eq!(first.locator(), format!("@{at}"));
+
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-25T20:00:00Z")?.timestamp_millis();
+    let late = run_search(&fx.index_dir, &opts(Some(since)))?;
+    assert!(late[0].snippets.iter().all(|s| s.time_ms >= since));
+    assert_eq!(late[0].snippets.len(), 4, "20:00–23:00");
     Ok(())
 }

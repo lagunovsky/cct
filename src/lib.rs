@@ -15,6 +15,7 @@ pub mod path_codec;
 pub mod picker;
 pub mod recent;
 pub mod rename;
+pub mod show;
 pub mod term;
 pub mod text;
 pub mod transfer;

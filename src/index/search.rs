@@ -60,6 +60,56 @@ pub struct SearchOptions {
     /// by default: pipelines start them by the thousand, all alike, and they
     /// would crowd out the sessions a person actually had.
     pub headless: bool,
+    /// Search one session only (its full id): every match in it, oldest
+    /// first, with `limit` counting snippets instead of sessions.
+    pub session: Option<String>,
+    /// Only lines whose record timestamp falls in this window (ms, inclusive).
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+}
+
+/// Per-search bounds on the snippet pass.
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    context_chars: usize,
+    fuzzy: bool,
+    /// Snippets one scan of a file renders, and one session keeps.
+    per_file: usize,
+    per_session: usize,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+}
+
+impl ScanLimits {
+    fn new(opts: &SearchOptions) -> Self {
+        let (per_file, per_session) = match opts.session {
+            // Every match, so the timeline can be cut by time rather than by
+            // whichever chunks happened to be verified first.
+            Some(_) => {
+                let cap = SESSION_SNIPPET_CAP.max(opts.limit);
+                (cap, cap)
+            }
+            None => (6, MAX_SNIPPETS_PER_SESSION),
+        };
+        Self {
+            context_chars: opts.context_chars,
+            fuzzy: opts.fuzzy,
+            per_file,
+            per_session,
+            since_ms: opts.since_ms,
+            until_ms: opts.until_ms,
+        }
+    }
+
+    fn windowed(&self) -> bool {
+        self.since_ms.is_some() || self.until_ms.is_some()
+    }
+
+    fn in_window(&self, ts: i64) -> bool {
+        ts > 0
+            && self.since_ms.is_none_or(|s| ts >= s)
+            && self.until_ms.is_none_or(|u| ts <= u)
+    }
 }
 
 /// What decides the order of the sessions handed back.
@@ -112,6 +162,8 @@ pub struct DisplayStats {
 }
 
 const MAX_SNIPPETS_PER_SESSION: usize = 10;
+/// Matches one `search -s` collects before sorting them by time.
+const SESSION_SNIPPET_CAP: usize = 2000;
 /// Display cap: how many of a session's snippets the renderers show.
 const MAX_SNIPPETS_SHOWN: usize = 5;
 
@@ -120,6 +172,29 @@ pub struct Snippet {
     pub tag: String,
     pub text: String,
     pub time_ms: i64,
+    /// Where the matched line sits: the file and the byte offset of the line
+    /// in it — what `cct show` takes to open the conversation there.
+    pub file: PathBuf,
+    pub offset: u64,
+}
+
+impl Snippet {
+    /// `@<offset>` in the session's main log, `@<path in session dir>:<offset>`
+    /// in a subagent log or tool result — the argument `cct show` takes.
+    pub fn locator(&self) -> String {
+        let (_, _, source) = parse_file_path(&self.file);
+        if source == "session" {
+            return format!("@{}", self.offset);
+        }
+        let rel = self
+            .file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|session_dir| self.file.strip_prefix(session_dir).ok())
+            .map(|r| r.display().to_string())
+            .unwrap_or_else(|| self.file.display().to_string());
+        format!("@{rel}:{}", self.offset)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +326,9 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
         if let Some(prefix) = &opts.project_prefix {
             hits.retain(|h| h.path.starts_with(prefix));
         }
+        if let Some(session) = &opts.session {
+            hits.retain(|h| parse_file_path(&h.path).0 == *session);
+        }
         per_query_groups.push(group_hits_by_file(hits));
     }
 
@@ -275,7 +353,8 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     // sessions hold every query string as shown text — or the candidates or
     // the budget run out. Index hits alone are not matches: a phrase may be
     // split by punctuation, a trigram AND is only a guess at a substring.
-    let verified = verify_candidates(&queries, &per_query_groups, opts);
+    let limits = ScanLimits::new(opts);
+    let verified = verify_candidates(&queries, &per_query_groups, opts, limits);
 
     // Session assembly per query string, then merge.
     let catalog = load_catalog_render(index_dir)?;
@@ -285,7 +364,7 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
     // crowd the later ones out of the per-session cap entirely.
     let mut snippet_rounds: BTreeMap<String, Vec<Vec<Snippet>>> = BTreeMap::new();
     for files in verified {
-        for (id, mut result) in build_session_results(files, catalog.as_ref()) {
+        for (id, mut result) in build_session_results(files, catalog.as_ref(), limits) {
             snippet_rounds
                 .entry(id.clone())
                 .or_default()
@@ -309,7 +388,13 @@ pub fn run_search(index_dir: &Path, opts: &SearchOptions) -> Result<Vec<SessionR
         if shown < queries.len() {
             merged.remove(&id);
         } else if let Some(session) = merged.get_mut(&id) {
-            session.snippets = interleave_snippets(rounds, MAX_SNIPPETS_PER_SESSION);
+            session.snippets = interleave_snippets(rounds, limits.per_session);
+            if opts.session.is_some() {
+                // One session read as a timeline, not a ranking.
+                session
+                    .snippets
+                    .sort_by(|a, b| (a.time_ms, &a.file, a.offset).cmp(&(b.time_ms, &b.file, b.offset)));
+            }
         }
     }
 
@@ -456,6 +541,7 @@ fn verify_candidates(
     queries: &[&str],
     per_query_groups: &[BTreeMap<PathBuf, Vec<DocHit>>],
     opts: &SearchOptions,
+    limits: ScanLimits,
 ) -> Vec<Vec<VerifiedFile>> {
     let candidates: Vec<Vec<Candidate>> = per_query_groups.iter().map(order_candidates).collect();
     let mut cursors = vec![0usize; queries.len()];
@@ -476,18 +562,20 @@ fn verify_candidates(
             }
             cursors[i] = end;
             let entries: Vec<(PathBuf, Vec<DocHit>)> = by_file.into_iter().collect();
-            let scans = generate_snippets_parallel(&entries, query, opts.context_chars, opts.fuzzy);
+            let scans = generate_snippets_parallel(&entries, query, limits);
             for ((path, hits), scan) in entries.into_iter().zip(scans) {
                 let slot = verified[i].entry(path).or_default();
                 slot.0.extend(hits);
-                slot.1.absorb(scan);
+                slot.1.absorb(scan, limits.per_session);
             }
         }
         let exhausted = cursors
             .iter()
             .zip(&candidates)
             .all(|(cursor, c)| *cursor >= c.len().min(cap));
-        if exhausted || confirmed_sessions(&verified) >= opts.limit {
+        // A single session is read in full: `limit` there counts snippets,
+        // and the ones wanted may sit in its least promising chunks.
+        if exhausted || (opts.session.is_none() && confirmed_sessions(&verified) >= opts.limit) {
             break;
         }
         batch = batch.saturating_mul(2);
@@ -569,6 +657,7 @@ fn group_hits_by_file(hits: Vec<DocHit>) -> BTreeMap<PathBuf, Vec<DocHit>> {
 fn build_session_results(
     files: Vec<VerifiedFile>,
     catalog: Option<&CatalogRender>,
+    limits: ScanLimits,
 ) -> BTreeMap<String, SessionResult> {
     let mut by_session: BTreeMap<String, SessionResult> = BTreeMap::new();
     for (path, hits, scan) in files {
@@ -613,7 +702,7 @@ fn build_session_results(
         }
 
         for s in file_snippets {
-            if entry.snippets.len() >= MAX_SNIPPETS_PER_SESSION {
+            if entry.snippets.len() >= limits.per_session {
                 break;
             }
             if entry
@@ -715,9 +804,9 @@ pub struct FileScan {
 
 impl FileScan {
     /// Fold in the scan of more chunks of the same file.
-    fn absorb(&mut self, other: FileScan) {
+    fn absorb(&mut self, other: FileScan, cap: usize) {
         for s in other.snippets {
-            if self.snippets.len() >= MAX_SNIPPETS_PER_SESSION {
+            if self.snippets.len() >= cap {
                 break;
             }
             if !self.snippets.iter().any(|existing| existing.text == s.text) {
@@ -737,14 +826,13 @@ const MATCH_LINE_CAP: u32 = 200;
 fn generate_snippets_parallel(
     entries: &[(PathBuf, Vec<DocHit>)],
     query: &str,
-    context_chars: usize,
-    fuzzy: bool,
+    limits: ScanLimits,
 ) -> Vec<FileScan> {
     let n = entries.len();
     if n <= 1 {
         return entries
             .iter()
-            .map(|(p, h)| snippets_for_hits(p, h, query, context_chars, fuzzy))
+            .map(|(p, h)| snippets_for_hits(p, h, query, limits))
             .collect();
     }
     let workers = std::thread::available_parallelism()
@@ -756,7 +844,7 @@ fn generate_snippets_parallel(
     if workers == 1 {
         return entries
             .iter()
-            .map(|(p, h)| snippets_for_hits(p, h, query, context_chars, fuzzy))
+            .map(|(p, h)| snippets_for_hits(p, h, query, limits))
             .collect();
     }
 
@@ -776,7 +864,7 @@ fn generate_snippets_parallel(
                     let (path, hits) = &entries[i];
                     local.push((
                         i,
-                        snippets_for_hits(path, hits, query, context_chars, fuzzy),
+                        snippets_for_hits(path, hits, query, limits),
                     ));
                 }
                 local
@@ -794,13 +882,12 @@ fn generate_snippets_parallel(
     out
 }
 
-fn snippets_for_hits(
-    path: &Path,
-    hits: &[DocHit],
-    query: &str,
-    context_chars: usize,
-    fuzzy: bool,
-) -> FileScan {
+fn snippets_for_hits(path: &Path, hits: &[DocHit], query: &str, limits: ScanLimits) -> FileScan {
+    let ScanLimits {
+        context_chars,
+        fuzzy,
+        ..
+    } = limits;
     let mut out = Vec::new();
     let mut match_lines = 0u32;
     let mut edited_paths = BTreeSet::new();
@@ -847,7 +934,7 @@ fn snippets_for_hits(
         })
         .collect();
     let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
-    let mut budget = 6usize;
+    let mut budget = limits.per_file;
 
     // Archived sessions: the live file is gone — decompress the zstd twin
     // once and serve every hit range from memory.
@@ -868,10 +955,15 @@ fn snippets_for_hits(
             // path itself so the session isn't dropped as snippet-less.
             let text = path.display().to_string();
             if !out.iter().any(|existing: &Snippet| existing.text == text) {
+                if limits.windowed() {
+                    continue;
+                }
                 out.push(Snippet {
                     tag: "path".to_string(),
                     text,
                     time_ms: 0,
+                    file: path.to_path_buf(),
+                    offset: 0,
                 });
                 budget = budget.saturating_sub(1);
             }
@@ -912,6 +1004,10 @@ fn snippets_for_hits(
             if is_boilerplate_line(line) || !indexed_text_matches(line, &needles_lower) {
                 continue;
             }
+            let ts = extract_top_level_timestamp_ms(line);
+            if limits.windowed() && !limits.in_window(ts) {
+                continue;
+            }
             match_lines += 1;
             if let Some(edited) = edited_path(line) {
                 let lower_path = edited.to_lowercase();
@@ -926,7 +1022,6 @@ fn snippets_for_hits(
                 continue;
             }
             let tag = classify_line(line);
-            let ts = extract_top_level_timestamp_ms(line);
             for (needle, variants) in needles.iter().zip(needle_variants.iter()) {
                 if !variants.iter().any(|v| lower.contains(v.as_str())) {
                     continue;
@@ -942,6 +1037,8 @@ fn snippets_for_hits(
                         tag: tag.clone(),
                         text: snippet_text,
                         time_ms: ts,
+                        file: path.to_path_buf(),
+                        offset: abs as u64,
                     });
                     budget = budget.saturating_sub(1);
                     if budget == 0 {
@@ -1380,10 +1477,15 @@ pub fn session_json(
     tools: u32,
     bytes: u64,
     verbose: bool,
+    all_snippets: bool,
 ) -> serde_json::Value {
     let last_activity = chrono::DateTime::from_timestamp_millis(s.last_msg_ms)
         .map(|d| d.with_timezone(&chrono::Local).to_rfc3339());
-    let snippets = select_visible_snippets(&s.snippets, verbose);
+    let snippets: Vec<&Snippet> = if all_snippets {
+        s.snippets.iter().collect()
+    } else {
+        select_visible_snippets(&s.snippets, verbose)
+    };
     let mut value = serde_json::json!({
         "session_id": s.session_id,
         "title": s.title,
@@ -1397,11 +1499,19 @@ pub fn session_json(
         // Relevance before age damping. Comparable within one search only —
         // an agent can tell "clearly the best hit" from "one of twenty".
         "score": (s.score * 1000.0).round() / 1000.0,
-        "snippets": snippets.iter().take(MAX_SNIPPETS_SHOWN).map(|sn| serde_json::json!({
-            "tag": sn.tag,
-            "time_ms": sn.time_ms,
-            "text": sn.text,
-        })).collect::<Vec<_>>(),
+        "snippets": snippets
+            .iter()
+            .take(if all_snippets { usize::MAX } else { MAX_SNIPPETS_SHOWN })
+            .map(|sn| serde_json::json!({
+                "tag": sn.tag,
+                "time_ms": sn.time_ms,
+                "text": sn.text,
+                // `cct show <session_id> <at>` opens the conversation here.
+                "at": sn.locator(),
+                "file": sn.file.display().to_string(),
+                "offset": sn.offset,
+            }))
+            .collect::<Vec<_>>(),
     });
     if verbose {
         value["files"] = serde_json::json!(s
@@ -1442,9 +1552,16 @@ pub fn select_visible_snippets(snippets: &[Snippet], verbose: bool) -> Vec<&Snip
 }
 
 /// Print snippets respecting the three-tier fallback used by the Go tool.
-pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, fuzzy: bool) {
+/// `verbose` shows every tier and each snippet's @location; `all` lifts the
+/// display cap too — one session's timeline from `search -s`.
+pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, fuzzy: bool, all: bool) {
     use crate::term::highlight_any;
-    let show = select_visible_snippets(snippets, verbose);
+    // A session timeline keeps its order; tiers would regroup it by kind.
+    let show: Vec<&Snippet> = if all {
+        snippets.iter().collect()
+    } else {
+        select_visible_snippets(snippets, verbose)
+    };
     let mut token_strings: Vec<String> = Vec::new();
     for query in queries {
         if fuzzy {
@@ -1474,9 +1591,14 @@ pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, f
     let token_refs: Vec<&str> = token_strings.iter().map(|s| s.as_str()).collect();
 
     for (j, s) in show.iter().enumerate() {
-        if j >= MAX_SNIPPETS_SHOWN {
+        if j >= MAX_SNIPPETS_SHOWN && !all {
             break;
         }
+        let at = if verbose {
+            format!(" {}", s.locator())
+        } else {
+            String::new()
+        };
         let ts = if s.time_ms > 0 {
             chrono::DateTime::from_timestamp_millis(s.time_ms)
                 .map(|d| {
@@ -1496,12 +1618,12 @@ pub fn print_snippets(snippets: &[Snippet], queries: &[String], verbose: bool, f
         let highlighted = dim_ellipses(&highlighted);
         if !s.tag.is_empty() {
             println!(
-                "  {DIM}{ts}[{tag}]{RESET} {text}",
+                "  {DIM}{ts}[{tag}]{at}{RESET} {text}",
                 tag = s.tag,
                 text = highlighted,
             );
         } else {
-            println!("  {DIM}{ts}{RESET}{text}", text = highlighted);
+            println!("  {DIM}{ts}{at}{RESET} {text}", text = highlighted);
         }
     }
 }
@@ -1529,11 +1651,15 @@ mod tests {
                     tag: "prompt".to_string(),
                     text: "fix the auth ⋯ timeout".to_string(),
                     time_ms: 1_700_000_000_000,
+                    file: PathBuf::from("/p/-x/abc-123.jsonl"),
+                    offset: 0,
                 },
                 Snippet {
                     tag: "agent".to_string(),
                     text: "subagent found it".to_string(),
                     time_ms: 1_700_000_000_000,
+                    file: PathBuf::from("/p/-x/abc-123.jsonl"),
+                    offset: 0,
                 },
             ],
             last_msg_ms: 1_700_000_000_000,
@@ -1600,7 +1726,7 @@ mod tests {
 
     #[test]
     fn session_json_is_flat_and_ansi_free() {
-        let v = session_json(&sample_session(), 12, 34, 5678, false);
+        let v = session_json(&sample_session(), 12, 34, 5678, false, false);
         assert_eq!(v["session_id"], "abc-123");
         assert_eq!(v["title"], "my-session");
         assert_eq!(v["archived"], true);
@@ -1619,12 +1745,12 @@ mod tests {
     fn session_json_respects_verbose_tiers() {
         // Without -v: prompt tier only, no files — same economy as the
         // human renderer.
-        let v = session_json(&sample_session(), 1, 2, 3, false);
+        let v = session_json(&sample_session(), 1, 2, 3, false, false);
         assert_eq!(v["snippets"].as_array().unwrap().len(), 1);
         assert!(v.get("files").is_none());
 
         // With -v: agent/hook snippets and file paths appear.
-        let v = session_json(&sample_session(), 1, 2, 3, true);
+        let v = session_json(&sample_session(), 1, 2, 3, true, false);
         let tags: Vec<&str> = v["snippets"]
             .as_array()
             .unwrap()

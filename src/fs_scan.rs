@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 /// What kind of source produced the file. Used for classification only;
 /// the index treats them uniformly.
@@ -92,6 +92,50 @@ fn scan_entrypoint(log: &Path) -> Option<bool> {
         }
         if let Some(headless) = crate::text::headless_entrypoint(&line) {
             return Some(headless);
+        }
+    }
+}
+
+/// The session file whose id is `q` or starts with it, in any project.
+/// `None` when nothing matches; an error when a prefix fits several.
+pub fn find_session_log(projects: &Path, q: &str) -> Result<Option<PathBuf>> {
+    // An id never holds a path separator; refusing them keeps `../x` from
+    // reaching outside the projects dir.
+    if q.is_empty() || q.contains(['/', '\\']) || q == "." || q == ".." {
+        return Ok(None);
+    }
+    let mut exact: Vec<PathBuf> = Vec::new();
+    let mut prefixed: Vec<PathBuf> = Vec::new();
+    for project in fs::read_dir(projects).with_context(|| format!("read dir {}", projects.display()))? {
+        let project = project?;
+        if !project.file_type()?.is_dir() {
+            continue;
+        }
+        let candidate = project.path().join(format!("{q}.jsonl"));
+        if candidate.is_file() {
+            exact.push(candidate);
+            continue;
+        }
+        for entry in fs::read_dir(project.path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(q) && name.ends_with(".jsonl") && entry.file_type()?.is_file() {
+                prefixed.push(entry.path());
+            }
+        }
+    }
+    let matches = if exact.is_empty() { prefixed } else { exact };
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        n => {
+            let mut msg = format!("id prefix {q:?} is ambiguous ({n} matches):");
+            for p in matches.iter().take(10) {
+                let id = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                msg.push_str(&format!("\n  {id}"));
+            }
+            bail!(msg)
         }
     }
 }
