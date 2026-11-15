@@ -1,454 +1,74 @@
 # cct
 
-Claude Code Tools — fast full-text search across [Claude Code](https://claude.com/claude-code)
-session logs, including subagent logs and tool results, plus utilities to
-rename projects, transfer sessions between them and archive old ones.
+**Search everything you and Claude Code ever did.**
+
+You've had hundreds of sessions with Claude Code. Somewhere in there is the fix
+for the exact error you're staring at, the reason that config looks the way it
+does, the command that finally made the build pass. `/resume` shows you titles.
+`cct` finds the line.
 
 ```sh
-cct "auth timeout"                     # search the current project's sessions
-cct -g "PreToolUse" "matcher"          # all projects; a session must hold both
-cct blame src/auth/session.ts          # which sessions discussed or edited a file
-cct search -s 499d80ae --since 2h "lock"   # every match inside one session
+cct "connection reset"                 # this project's sessions, best match first
+cct -g "stripe webhook" "signature"    # every project; a session must hold both
+cct blame src/auth/session.ts          # sessions that edited or discussed this file
+cct search -s 499d80ae --since 2h "lock"   # every match inside one long session
 cct show 499d80ae @495579478           # read the conversation around a match
+cct                                    # recent sessions here, with their last prompts
 ```
 
-The search backend is [Tantivy](https://github.com/quickwit-oss/tantivy): three
-physical indexes (word, trigram, path) sit under `~/.claude/search-index/`,
-share a single TSV catalog of file metadata, and support incremental updates
-that only re-read the bytes that actually changed.
+## Why it's good
 
-The corpus comes from the standard Claude Code layout:
-
-```
-~/.claude/projects/<encoded-project>/<session>.jsonl
-~/.claude/projects/<encoded-project>/<session>/subagents/*.jsonl
-~/.claude/projects/<encoded-project>/<session>/tool-results/*.{txt,json,jsonl,md,log,csv,tsv,html,htm,xml}
-```
-
-PDFs and other binary tool-results are deliberately not indexed.
-
-Neither are the `attachment` records Claude Code writes into every session —
-the system prompt snapshot, skill and tool listings, CLAUDE.md and auto-memory,
-output style, environment, model, date. Since September 2026 they are about
-2 GB of a 10.8 GB corpus and identical across sessions, so a word from your
-instructions or memory used to match thousands of sessions at once. The
-attachments that record what happened in a session stay indexed: prompts queued
-while the agent worked, subagent `structured_output`, edited files, diagnostics,
-todos, hook errors, plans. The exclusion list is `BOILERPLATE_ATTACHMENTS` in
-`src/text.rs`; snippets skip those lines too, so an index built before the
-change stops showing them even before `cct reindex`.
-
-Copies are left out as well: base64 (thinking signatures, images), per-record
-uuids and timestamps, `api-request*` and `file-history-snapshot` records,
-queued prompts that were later delivered, and `toolUseResult` strings the
-record's tool_result already holds. On a 19.7 GB corpus this took the index
-from 3.2 GB to 0.6 GB (before word positions, below). Snippets come from the same fields, so a session is never
-found through text it cannot show. See `for_each_indexed_string`.
+- **Searches what Claude actually saw** — your prompts, its answers, tool calls,
+  command output, subagent logs, saved tool results. Not just session titles.
+- **Fast on a big history.** A Tantivy index, updated incrementally before each
+  search: 20 GB of logs answer in a fraction of a second.
+- **Finds the place, not just the session.** `-s` lists every match in one
+  session by time; `cct show` opens the conversation right there.
+- **`cct blame <file>`** — which sessions changed a file (even through `sed` or
+  a python script), which only talked about it.
+- **Your agent can use it too.** `--json` output and a three-line CLAUDE.md
+  snippet (below) let Claude look up its own past work instead of guessing.
+- **Keeps history around.** Claude Code deletes transcripts after 30 days by
+  default; `cct` warns about it, archives old sessions into zstd (4–8× smaller)
+  and keeps them searchable.
+- **Fixes `/resume` after you move a project.** `cct rename` and `cct transfer`
+  carry sessions to the new path.
+- **Ignores the noise.** System prompts, CLAUDE.md copies, base64 blobs and
+  thousands of identical `claude -p` pipeline runs stay out of your results
+  (`--headless` brings those back).
 
 ## Install
 
-Needs a Rust toolchain (stable). macOS and Linux; the background daemon is
-macOS-only (launchd).
-
 ```sh
 cargo install --git https://github.com/lagunovsky/cct
-
-# or from a clone
-cargo install --path .
 ```
 
-The first search builds the index under `~/.claude/search-index/`; on a large
-history that takes a few minutes, later searches update it incrementally.
+Needs a stable Rust toolchain; macOS or Linux. The first search builds the
+index in `~/.claude/search-index/` — a few minutes on a large history, then
+incremental. On macOS, `cct daemon install` keeps it fresh in the background.
 
-## Quick start
+## Teach Claude to use it
 
-```sh
-cct                              # recent sessions in cwd
-cct recent -n 50                 # explicit, more results
-cct search "рефакторинг"         # full-text search in cwd's project
-cct "рефакторинг"                # same — a bare argument implies `search`
-cct search -g "API error"        # global search across all projects
-cct search -p ../other "TODO"    # search a different project
-cct search -n 50 -c 200 "trace"
-cct search "auth" "timeout"      # AND: session must contain all strings
-cct search --sort time "auth"    # newest first instead of best match first
-cct blame src/index/search.rs    # sessions that discussed this file
-cct reindex                      # rebuild the index from scratch
-cct update                       # incremental update (also runs implicitly on search)
-cct compact                      # collapse Tantivy segments to a single one
-cct daemon install               # 30 min background updates on AC power
-cct daemon uninstall
+Add this to `~/.claude/CLAUDE.md`:
+
+```markdown
+## Session history
+- `cct search --json "query"` searches past Claude Code sessions in this project (`-g` for all projects); several arguments must all match within one session
+- `cct blame <path>` — sessions that discussed or edited a file
+- To find a spot inside one session: `cct search -s <id> --since "2026-10-25 18:00" "query"`, then `cct show <id> @<location>`
 ```
 
-## Index layout
-
-```
-~/.claude/search-index/
-  word/         SimpleTokenizer + LowerCaser → natural-language queries, short tokens like "АД"
-  trigram/      NgramTokenizer(3,3) + LowerCaser → APIError, traceback substrings
-  path/         trigram over file paths
-  catalog.tsv   per-file row: file_id, kind, size, mtime_ms, indexed_offset, next_chunk_id, prompts, tools, display_bytes, title, path
-  manifest.txt  source dir, enabled indexes, writer config used to build it
-```
-
-The `word` index truncates tokens to 32 characters. On real logs everything
-above that length is base64 blobs, hashes and ids — 30% of the vocabulary and
-68% of its bytes, 88% of them seen exactly once — so storing only their prefix
-shrinks the term dictionary substantially without making them unfindable: a
-query for the full string is truncated the same way and matches the same term,
-and the snippet pass then verifies the whole string against the file, so two
-blobs sharing a prefix cannot pass as each other. The cap counts characters, not
-bytes, so Cyrillic words are not cut at half the length.
-
-Dropping oversized tokens instead was the first attempt — it shrinks `word` by
-~70% rather than by a prefix — on the theory that `trigram` could answer such
-queries as substrings. On the real index it cannot: a 512 KB chunk contains
-nearly every trigram, so AND-ing them barely narrows the candidate set and the
-one chunk holding the string never survives the candidate limit. Searching for a
-key you actually have is worth more than the extra megabytes.
-
-Word postings carry term frequencies (`WithFreqs`); the ngram indexes do not.
-Frequencies cost ~9% of the `word` index and are what let a chunk that mentions
-the query twenty times outrank one that mentions it once.
-
-Together, truncation and a fresh full merge took a real 10.4 GB corpus from a
-6.8 GB index to 2.2 GB (`word` 5.1 GB → 1.7 GB), and searches on it run in
-60–140 ms instead of 0.4–1.2 s. Old indexes keep working; `cct reindex` is what
-applies the change.
-
-`file_id` is stable across updates so deletes / re-adds use a single
-`delete_term` per physical index.
-
-Each Tantivy document also stores an exact `project_id` (the encoded project
-directory under `~/.claude/projects`) so cwd / `--project` searches can filter
-inside Tantivy instead of collecting global candidates first. Schema/catalog
-changes are not backward-compatible; rebuild old indexes with `cct reindex`.
-
-Each Tantivy document is one **content chunk** (~512 KB of complete jsonl
-lines), not a whole file, so snippets can be regenerated by reading just the
-chunk's byte range from disk.
-
-## Search behaviour
-
-A bare first argument that is neither a flag nor a known subcommand is treated
-as an implicit `search` query, so `cct ветка` runs `cct search ветка`. The
-trade-off is that a mistyped command (`cct reindx`) becomes a search rather
-than an error.
-
-`cct search` opens an incremental update before querying; if nothing changed,
-the writer cycle is skipped entirely. Pass `--no-update` to suppress it.
-
-Project-scoped searches (`cwd` default or `--project`) add an exact
-`project_id` filter inside Tantivy.
-
-The query analyzer is the same SimpleTokenizer as the index, so token-level
-matches work consistently. `cct search` always queries the **word** index and
-adds:
-
-- **trigram** when the query looks technical: mixed case, all-uppercase
-  acronym (`API`, `HTTP`), digit, `_-:.#@`, or non-ASCII length ≥ 3 (so
-  `давление` adds trigram while a 2-char `АД` stays word-only).
-- **path** when the query contains `/`, `\`, or `~`.
-
-You can pin to a specific backend with `--mode word|trigram|path|all`.
-
-Multiple query arguments are AND-ed at the session level: each string may
-match anywhere in the session (main log, subagent log, or tool result), and
-only sessions containing all of them are returned. Index selection above is
-per string. Within a single string, tokens must co-occur in nearby context.
-
-`--json` switches to machine-readable output for agents and scripts: one JSON
-object per session on stdout (id, title, project, archived, timestamps,
-prompt/tool/byte stats, snippets with tags), no colors or progress text;
-progress and warnings go to stderr. Content matches the human output — `-v`
-widens snippets to agent/hook matches and adds matched file paths, so shallow
-searches stay cheap by default.
-
-## Result order
-
-Results are ranked by relevance, not by date. A session's score is the number
-of lines that actually matched — weighted by where they matched (`session` 1.0,
-`subagent` 0.7, tool results and hooks 0.5) and by which index found them
-(`word` 1.0, `trigram` 0.7, `path` 0.4) — passed through `ln(1+x)` so a long
-session cannot win on volume alone. A match in your own prompt gets ×1.3, and
-the whole score is damped by age with a 180-day half life, which leaves recency
-as a tiebreaker between comparable matches rather than the answer itself.
-
-Counting matched lines rather than trusting Tantivy's BM25 is deliberate: a
-document here is a 512 KB chunk, and BM25's length normalization cancels out
-almost exactly the term frequency it is supposed to reward. BM25 still decides
-the order in which candidate chunks are verified: the best ones first, in
-rounds that double in size, until `-n` sessions show a snippet for every query
-string (or 4000 chunks per string have been read).
-
-The word index keeps token positions, so a multi-word string is a phrase query
-there rather than an AND of words anywhere in a 512 KB chunk. Without them a
-phrase of common words ("could refute this") matched thousands of chunks, the
-real ones never reached the front, and the search came back empty. Positions
-triple the index (0.6 → 2.0 GB on a 19.7 GB corpus). Several query strings
-are AND-ed over every index hit, not over each string's best few.
-
-`--sort time` restores the old behaviour — newest session first, regardless of
-match quality. `--json` reports the pre-damping score per session.
-
-Headless sessions — `claude -p` and the Agent SDK, which Claude Code marks
-with `"entrypoint":"sdk-cli"` — are indexed but left out of `search` and
-`blame` unless `--headless` is passed. Review pipelines start them by the
-thousand from one prompt template, and they crowded the sessions a person
-actually had out of the results. Subagent logs and tool results follow their
-session.
-
-To find a place inside one session — a long one, where five snippets out of
-hundreds of matches say little — search it alone and read around the match:
-
-```sh
-cct search -s 499d80ae --since "2026-10-25 18:00" --until 2026-10-25 "запер"
-cct show 499d80ae @495579478          # the conversation around that match
-cct show 499d80ae --time "2026-10-25 19:46" -C 10
-cct show 499d80ae                     # the end of the session
-```
-
-`-s <id>` lists every match in the session oldest first, with `-n` counting
-snippets; each carries the `@location` of its line (`@<offset>` in the main
-log, `@subagents/<file>:<offset>` in a subagent log), which `-v` also prints in
-ordinary searches and `--json` returns as `at`, `file` and `offset`.
-`--since`/`--until` (a date, `"2026-10-25 18:00"`, or an age like `2h`, `3d`)
-work in any search. `cct show` prints prompts, answers, tool calls and their
-results around the point, `-C` records on each side, long ones cut unless
-`--full`.
-
-Multi-word queries are matched as a phrase on one line by default.
-Pass `-f`/`--fuzzy` to treat tokens independently and emit per-token snippets
-even when the full phrase never appears on a single line.
-
-Slash-command invocations (`<command-name>/research</command-name>` blocks in
-the logs) are indexed and rendered as plain `/research <args>`, so searching
-for `/research` finds the sessions that ran it.
-
-Sessions named via `/rename` (`{"type":"custom-title",…}` records) show that
-name next to the session id in both `recent` and `search` output; the last
-rename wins. The title is cached in the catalog so search never re-reads the
-jsonl for it.
-
-Snippets come from the chunk byte range stored on each Tantivy doc, then
-re-extracted as JSON values when possible. The default context window is `120`
-characters around the match (`-c N` to override).
-
-## Update strategy
-
-| change kind                       | action                                                                  |
-|-----------------------------------|-------------------------------------------------------------------------|
-| new file                          | full add with new `file_id`                                             |
-| `.jsonl` grew                     | read `[indexed_offset, last_complete_newline)` only — partial trailing line is left until next update |
-| non-jsonl rewrite, shrink, mtime change | delete by `file_id`, re-add fully                                  |
-| file removed                      | delete by `file_id`, drop from catalog                                  |
-| unchanged                         | no read, no writer touch                                                |
-
-A single `cct update` is enough for normal use. The `daemon` subcommand wires
-that up to launchd at 30-minute intervals so most searches run on an already
-warm index.
-
-After a search, an update, a daemon run or an archive pass, `cct` tidies the
-index. The delta is merged once a sub-index reaches 8 segments. The main index
-is merged once it reaches 16 segments, or once more than 20% of its documents
-are deleted: the small segments, plus any segment that is more than 30% dead,
-fold into one, while the 4 largest healthy segments are left alone. That keeps
-each pass cheap — it touches what accumulated since the last one, not the
-gigabytes written by the reindex.
-
-Before this, nothing merged the main index except an explicit `cct compact`.
-Every flush commits a segment into main, and a flush re-adds a grown session
-whole while only marking its previous copy deleted. Ten weeks of the daemon
-flushing every 30 minutes left 3,500 segments per sub-index and 48% of all
-documents dead; with a term dictionary per segment, `.term` files alone took
-5.7 of the `word` index's 7 GB.
-
-## Merge policy / memory
-
-| command   | merge policy default | memory default                                                       |
-|-----------|----------------------|----------------------------------------------------------------------|
-| `reindex` | `log` (Tantivy default) | physical RAM / 6, clamped 768 MB … 8192 MB, fallback 5048 MB      |
-| `update`  | `none` during the update, then the routine tidy above | 768 MB total, split per enabled index |
-| `compact` | `none` + explicit merge to `--target-segments` (default 1) | 768 MB                                                        |
-
-All three honor `--memory-mb`, `--worker-threads`, `--merge-threads`, and
-`--only word,trigram,path`.
-
-## Blame
-
-`cct blame <path>` answers the other direction: not "where was this word
-discussed" but "which sessions worked on this file, and what did they say".
-
-```sh
-cct blame src/index/search.rs      # sessions in the current project
-cct blame -g Cargo.toml            # across all projects
-cct blame --json src/cli.rs        # one object per session, plus "mention": edited|qualified|bare
-```
-
-The index knows nothing about which files a session touched — transcripts
-mention paths as ordinary text — so blame searches for the basename and then
-verifies every hit, in three tiers:
-
-1. **edited** — the session changed the file: an `Edit`/`Write`/`MultiEdit`
-   call on it, or an `edited_text_file` record. The latter is what Claude Code
-   writes when a file the session has seen changes on disk, and it is the only
-   trace a Bash, sed or python edit leaves — 45% of all such records are the
-   session's own Bash edits. These sessions print an `edited <path>` line, and
-   the record shows up as an `[edited]` snippet.
-2. **qualified** — the session wrote `src/index/search.rs` or a longer tail.
-3. **bare** — only `search.rs`; a name inside a longer word (`research.rsync`)
-   is dropped.
-
-Within each tier the normal relevance order applies. An `edited_text_file` for
-CLAUDE.md or an auto-memory file is not indexed: Claude Code broadcasts it into
-every session open at the time (20 sessions for one MEMORY.md change), and the
-session that made the edit shows it through its own `Edit`/`Write` call.
-
-An existing path is resolved against the filesystem, so `cct blame ./cli.rs`
-and `cct blame src/cli.rs` behave the same. A path that no longer exists still
-works — it is matched as typed, which is the point when the file was deleted
-months ago.
-
-## Rename / transfer
-
-If a project's directory was renamed or moved, `/resume` in Claude Code stops
-finding past sessions because they live under
-`~/.claude/projects/<encoded-path>/` and the embedded `cwd` field still points
-at the old path.
-
-`cct rename` physically moves the project directory and migrates all of its
-sessions in one step:
-
-```sh
-cct rename ../new-name                    # old = cwd
-cct rename /old/abs /new/abs              # explicit
-cct rename --no-move-dir . ../new         # dir already moved on disk; only fix sessions
-cct rename --dry-run . ../new             # preview only
-```
-
-This moves the on-disk project dir, renames
-`~/.claude/projects/<encoded-old>` → `<encoded-new>`, and rewrites every
-occurrence of the old absolute path inside `.jsonl` files (including `cwd`).
-Pass `--no-move-dir` when the project directory was already moved by hand and
-only the session logs need their `cwd` rewired. The next `cct update` (or any
-`cct search`) reconciles the index by deleting the old `file_id`s and re-adding
-the relocated files.
-
-`cct transfer` moves individual sessions from one project into another:
-
-```sh
-cct transfer abc123 ../other              # by full id or unique prefix, from any project
-cct transfer abc123 def456 ../other       # several; the target always comes last
-cct transfer abc123,def456 ../other       # comma-separated also accepted
-cct transfer my-session ../other          # by /rename title
-cct transfer --from /old/proj dev ../other  # a title several projects share
-cct transfer ../other                     # interactive: pick sessions from cwd
-cct transfer --dry-run abc123 ../other    # preview
-cct transfer -y abc123 ../other           # skip confirmation prompt
-```
-
-An id names one session wherever it lives, so no source project is needed:
-the session is found under `~/.claude/projects`, and the project path that gets
-rewritten to the target comes from its own `cwd` records. A title is looked up
-in the current project first, then in every project through the index catalog;
-when several projects have a session by that name, the error lists them and
-`--from` picks one.
-
-Selection in the picker accepts space-toggling, `a`/`A` for select-all/none,
-`/` to filter, and Enter to confirm.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `cct search <query>` | Full-text search; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `-f`, `-s`, `--since`, `--until`, `--json`, `--mode`, `--sort`, `--headless`, `--no-update` |
-| `cct show <id> [@loc]` | Read a session around a search match, a `--time`, or its end; flags: `-C`, `--full` |
-| `cct blame <path>` | Which sessions discussed a file, and what they said; flags: `-n`, `-c`, `-v`, `-g`, `-p`, `--json`, `--headless`, `--no-update` |
-| `cct recent` | Recent sessions in cwd (headless ones only with `--headless`); flags: `-n`, `--headless` |
-| `cct reindex` | Rebuild the Tantivy index from scratch |
-| `cct update` | Incremental update (auto on each search; manual when scripted) |
-| `cct compact` | Merge Tantivy segments to `--target-segments` (default 1) |
-| `cct rename [old] <new>` | Move project dir + migrate sessions + rewrite `cwd`; flags: `--no-move-dir`, `--dry-run` |
-| `cct transfer <session>... <target>` | Transfer specific sessions between projects; flags: `--from`, `-y`, `--dry-run` |
-| `cct daemon install` | Install launchd job for background indexing every 30 min on AC power |
-| `cct daemon uninstall` | Remove launchd job |
-| `cct daemon update` | Background update entry point used by launchd |
-| `cct cleanup-period [days]` | Show or set Claude Code's transcript retention (`cleanupPeriodDays` in `~/.claude/settings.json`); flags: `--no-warn`, `--warn` |
-| `cct archive` | Move cold sessions into `~/.claude/archive` (zstd); flags: `--older-than` (default 90d), `--headless-older-than`, `-p`, `--dry-run`, `-y`, `--auto <age\|off>`, `--auto-headless <age\|off>` |
-| `cct unarchive <ids...>` | Restore archived sessions back into `~/.claude/projects`; flag: `--keep-mtime` |
-
-## Archiving
-
-`cct archive` moves sessions whose last activity is older than `--older-than`
-(default 90 days) into `~/.claude/archive`, mirroring the projects layout with
-each file zstd-compressed (~4-8x smaller on real logs). The search index keeps
-its documents: archived sessions still come up in `cct search`, snippets are
-served by on-the-fly decompression, and results are marked `[archived]`.
-Restoring with `cct unarchive <id>` brings the session back for
-`claude --resume`; the restored file gets a fresh mtime so Claude Code's
-age-based cleanup doesn't immediately reap it (pass `--keep-mtime` to
-preserve the original timestamp instead — at your own cleanup risk).
-
-Background archiving is opt-in: `cct archive --auto 90d` makes the launchd
-daemon archive cold sessions after each background index update
-(`cct archive --auto off` disables; the setting lives in
-`~/.config/cct/config`). `cct archive --auto-headless 10d` gives headless
-sessions their own, shorter age (`off` makes them follow `--auto` again);
-`--headless-older-than 10d` does the same for a manual run, and on its own
-archives headless sessions only.
-
-`cct recent` lists archived sessions alongside live ones, marked
-`[archived]`. Limitations: they don't appear in the transfer picker, and
-`cct rename`/`cct transfer` skip them — unarchive first.
-
-## Session retention
-
-Claude Code deletes session transcripts after 30 days by default
-(`cleanupPeriodDays`), which silently shrinks searchable history. Reindexing
-warns when retention is below 90 days; raise it with `cct cleanup-period 3650`
-or silence the warning with `cct cleanup-period --no-warn` (the choice is
-stored in `~/.config/cct/config`).
-
-## Trade-offs / non-goals
-
-- No PDF or binary indexing.
-- No `--all-tool-results` mode; only the text-like extensions above.
-- The catalog is plain TSV (atomic tmp+rename). Schema changes require
-  `cct reindex`.
-- `path` field is stored on every chunk doc; this is wasteful but simple. A
-  future pass can replace it with `file_id → path` lookups in the catalog.
-- The daemon is macOS-only; on other platforms `cct daemon install` errors
-  out, and `cct daemon update` runs the update without an AC-power gate.
-
-## Tests
-
-```sh
-cargo test
-```
-
-Integration tests live under `tests/index_tests.rs` and cover:
-
-- full reindex finds normal words,
-- trigram finds `APIError` substrings,
-- Russian short token `АД` works via word index,
-- non-ASCII ≥ 3 chars auto-adds trigram,
-- append update only indexes complete jsonl lines,
-- partial trailing lines stay invisible until newline appears,
-- unchanged update is a no-op,
-- deleted files lose hits,
-- shrink/rewrite force a full reindex of the file,
-- path search finds sessions by their path,
-- snippets come from the chunk byte range,
-- PDFs and other binaries are skipped,
-- an oversized token is found through its indexed prefix, while a different
-  blob sharing the same 32-char prefix is rejected by the snippet pass,
-- a 31-char identifier and a 25-char Cyrillic word are indexed whole,
-- relevance ranking puts a deep old match above a shallow fresh one, while
-  `--sort time` still returns newest first,
-- two equally strong matches are separated by recency.
-
-`src/blame.rs` unit-tests path recognition: qualified vs bare mentions,
-namesake rejection (`research.rsync`), and suffix generation.
+Now "how did we fix this last time?" gets an answer from your actual history.
+
+## Docs
+
+- [Search](docs/search.md) — queries, ranking, filters, searching inside a session, JSON output
+- [Blame](docs/blame.md) — which sessions worked on a file
+- [Moving projects](docs/projects.md) — `rename` and `transfer`
+- [Archive and retention](docs/archive.md) — `archive`, `unarchive`, the daemon, `cleanup-period`
+- [Command reference](docs/commands.md)
+- [How the index works](docs/internals.md) — what gets indexed, layout, updates, merging
+- [Development](docs/development.md)
 
 ## License
 
