@@ -215,7 +215,7 @@ pub fn collect_cct_layout(projects_dir: &Path) -> Result<Vec<DiscoveredFile>> {
 }
 
 /// Like `collect_cct_layout` but only walks one project's session directory
-/// (e.g. `~/.claude/projects/-Users-ivan-Work-projects-foo`). Used for
+/// (e.g. `~/.claude/projects/-Users-me-Work-projects-foo`). Used for
 /// scope-restricted searches so we don't stat 10k+ files across all projects.
 pub fn collect_one_project(project_session_dir: &Path) -> Result<Vec<DiscoveredFile>> {
     let mut out = Vec::new();

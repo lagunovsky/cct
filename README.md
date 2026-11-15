@@ -1,7 +1,16 @@
 # cct
 
-Claude Code Tools — fast full-text search across Claude Code session logs, plus
-utilities to rename projects and transfer sessions when project directories change.
+Claude Code Tools — fast full-text search across [Claude Code](https://claude.com/claude-code)
+session logs, including subagent logs and tool results, plus utilities to
+rename projects, transfer sessions between them and archive old ones.
+
+```sh
+cct "auth timeout"                     # search the current project's sessions
+cct -g "PreToolUse" "matcher"          # all projects; a session must hold both
+cct blame src/auth/session.ts          # which sessions discussed or edited a file
+cct search -s 499d80ae --since 2h "lock"   # every match inside one session
+cct show 499d80ae @495579478           # read the conversation around a match
+```
 
 The search backend is [Tantivy](https://github.com/quickwit-oss/tantivy): three
 physical indexes (word, trigram, path) sit under `~/.claude/search-index/`,
@@ -38,22 +47,26 @@ found through text it cannot show. See `for_each_indexed_string`.
 
 ## Install
 
-```sh
-# clone and build a release binary
-cargo build --release
-./target/release/cct --help
+Needs a Rust toolchain (stable). macOS and Linux; the background daemon is
+macOS-only (launchd).
 
-# or install into ~/.cargo/bin
+```sh
+cargo install --git https://github.com/lagunovsky/cct
+
+# or from a clone
 cargo install --path .
 ```
+
+The first search builds the index under `~/.claude/search-index/`; on a large
+history that takes a few minutes, later searches update it incrementally.
 
 ## Quick start
 
 ```sh
 cct                              # recent sessions in cwd
 cct recent -n 50                 # explicit, more results
-cct search "марат"               # full-text search in cwd's project
-cct "марат"                      # same — a bare argument implies `search`
+cct search "рефакторинг"         # full-text search in cwd's project
+cct "рефакторинг"                # same — a bare argument implies `search`
 cct search -g "API error"        # global search across all projects
 cct search -p ../other "TODO"    # search a different project
 cct search -n 50 -c 200 "trace"
@@ -436,3 +449,7 @@ Integration tests live under `tests/index_tests.rs` and cover:
 
 `src/blame.rs` unit-tests path recognition: qualified vs bare mentions,
 namesake rejection (`research.rsync`), and suffix generation.
+
+## License
+
+MIT

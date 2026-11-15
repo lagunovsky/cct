@@ -2,7 +2,12 @@
 name = "cct"
 version = "0.2.0"
 edition = "2021"
-description = "Claude Code Tools — full-text search across Claude Code sessions, plus rename/move utilities."
+description = "Fast full-text search across Claude Code session logs, plus project rename, session transfer and archiving"
+license = "MIT"
+repository = "https://github.com/lagunovsky/cct"
+readme = "README.md"
+keywords = ["claude", "claude-code", "search", "tantivy", "cli"]
+categories = ["command-line-utilities", "text-processing"]
 
 [lib]
 name = "cct"
@@ -32,6 +37,3 @@ filetime = "0.2"
 lto = "thin"
 codegen-units = 1
 strip = true
-
-[workspace]
-exclude = ["experiments/tantivy-probe"]

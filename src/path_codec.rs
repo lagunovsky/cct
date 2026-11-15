@@ -270,10 +270,10 @@ mod tests {
 
     #[test]
     fn encode_replaces_every_non_alphanumeric_with_dash() {
-        assert_eq!(encode_project_dir("/Users/ivan/.ssh"), "-Users-ivan--ssh");
+        assert_eq!(encode_project_dir("/Users/me/.ssh"), "-Users-me--ssh");
         assert_eq!(
-            encode_project_dir("/Users/ivan/Library/Application Support/com.mitchellh.ghostty"),
-            "-Users-ivan-Library-Application-Support-com-mitchellh-ghostty"
+            encode_project_dir("/Users/me/Library/Application Support/com.mitchellh.ghostty"),
+            "-Users-me-Library-Application-Support-com-mitchellh-ghostty"
         );
         assert_eq!(encode_project_dir("/a/b_c"), "-a-b-c");
         // Non-BMP chars are two UTF-16 units → two dashes, like Claude Code.

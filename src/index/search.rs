@@ -134,12 +134,12 @@ fn index_weight(kind: IndexKind) -> f32 {
 }
 
 /// A match the user typed themselves outranks one buried in tool output — the
-/// same 1.3 deja gives user messages.
+/// same 1.3 that deja-vu, another session-search tool, gives user messages.
 const PROMPT_BOOST: f32 = 1.3;
 
 /// Age at which a session's score is halved.
 ///
-/// deja uses `1/(1+age_days)` — a week-old session is already worth an eighth,
+/// deja-vu uses `1/(1+age_days)` — a week-old session is already worth an eighth,
 /// so over a corpus spanning years the ranking collapses back into "newest
 /// first" with extra steps. Six months keeps recency as a tiebreaker between
 /// comparable matches while a genuinely better old session can still win, which
