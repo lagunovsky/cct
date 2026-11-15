@@ -25,47 +25,70 @@ struct PromptPair {
     response: String,
 }
 
+/// One session `recent` may list: its logical live path (where an archived
+/// one would be restored to), its activity time and whether only the zstd
+/// twin in the archive exists.
+struct RecentSession {
+    path: PathBuf,
+    activity_ms: i64,
+    archived: bool,
+}
+
 pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let cwd_str = cwd.to_string_lossy().into_owned();
     let encoded = encode_project_dir(&cwd_str);
     let sessions_dir = projects_dir()?.join(&encoded);
 
-    let entries = match fs::read_dir(&sessions_dir) {
-        Ok(it) => it,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            println!("\n{DIM}No Claude Code sessions found for {cwd_str}{RESET}");
-            return Ok(());
+    let mut sessions: Vec<RecentSession> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&sessions_dir) {
+        for e in entries {
+            let e = e?;
+            if !e.file_type()?.is_file() {
+                continue;
+            }
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let activity_ms = session_activity_time_ms(&path);
+            sessions.push(RecentSession {
+                path,
+                activity_ms,
+                archived: false,
+            });
         }
-        Err(err) => return Err(err.into()),
-    };
-
-    let mut files: Vec<(PathBuf, i64)> = Vec::new();
-    for e in entries {
-        let e = e?;
-        if !e.file_type()?.is_file() {
-            continue;
-        }
-        let path = e.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let mtime = session_activity_time_ms(&path);
-        files.push((path, mtime));
     }
-    if files.is_empty() {
-        println!(
-            "\n{DIM}No sessions found in {}{RESET}",
-            sessions_dir.display()
-        );
+    // Archived sessions are the project's history too. Their `.zst` keeps the
+    // log's mtime, which stands in for the last activity without unpacking.
+    if let Ok(entries) = crate::archive::archive_root().and_then(|root| Ok(fs::read_dir(root.join(&encoded))?)) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".jsonl.zst") else {
+                continue;
+            };
+            let live = sessions_dir.join(format!("{id}.jsonl"));
+            if live.exists() {
+                continue;
+            }
+            let activity_ms = file_mtime_ms(&e.path());
+            sessions.push(RecentSession {
+                path: live,
+                activity_ms,
+                archived: true,
+            });
+        }
+    }
+    if sessions.is_empty() {
+        println!("\n{DIM}No Claude Code sessions found for {cwd_str}{RESET}");
         return Ok(());
     }
-    files.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.activity_ms));
     // Newest first, so only the logs that could make the list get their head
     // read for the entrypoint.
-    let shown: Vec<&(PathBuf, i64)> = files
+    let shown: Vec<&RecentSession> = sessions
         .iter()
-        .filter(|(path, _)| opts.headless || !crate::fs_scan::is_headless(path, None))
+        .filter(|s| opts.headless || !crate::fs_scan::is_headless(&s.path, None))
         .take(opts.limit)
         .collect();
     if shown.is_empty() {
@@ -78,23 +101,30 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
 
     println!("{BOLD}Recent sessions in:{RESET} {cwd_str}");
 
-    for (path, mtime_ms) in shown {
-        let session_id = path
+    for s in shown {
+        let session_id = s
+            .path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let (prompts, total_prompts, tool_calls, bytes, title) =
-            match load_session_summary(path, 2) {
+            match load_session_summary(&s.path, 2) {
                 Ok(v) => v,
                 Err(err) => {
                     println!("  {DIM}(error reading {session_id}: {err}){RESET}");
                     continue;
                 }
             };
+        let shown_path = if s.archived {
+            crate::archive::archive_path_for(&s.path).unwrap_or_else(|| s.path.clone())
+        } else {
+            s.path.clone()
+        };
         print_session_summary(
             &session_id,
-            path,
-            *mtime_ms,
+            &shown_path,
+            s.activity_ms,
+            s.archived,
             &prompts,
             total_prompts,
             tool_calls,
@@ -103,6 +133,15 @@ pub fn show_recent_sessions(opts: RecentOptions) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn file_mtime_ms(path: &Path) -> i64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 const TAIL_BYTES: u64 = 256 * 1024;
@@ -140,12 +179,7 @@ fn read_session_tail(path: &Path) -> Vec<u8> {
 
 /// Activity time for sorting: last top-level timestamp in the file (read via tail), else mtime.
 pub fn session_activity_time_ms(path: &Path) -> i64 {
-    let mtime_fallback = fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let mtime_fallback = file_mtime_ms(path);
 
     let data = read_session_tail(path);
     let ts = last_message_time_ms(&data);
@@ -178,7 +212,10 @@ fn load_session_summary(
     path: &Path,
     n: usize,
 ) -> Result<(Vec<PromptPair>, u32, u32, u64, Option<String>)> {
-    let data = fs::read(path)?;
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(err) => crate::archive::read_archived(path).ok_or(err)?,
+    };
     let bytes = data.len() as u64;
     let title = crate::text::extract_session_title(&data);
     let mut pairs = Vec::new();
@@ -320,6 +357,7 @@ fn print_session_summary(
     session_id: &str,
     path: &Path,
     mtime_ms: i64,
+    archived: bool,
     prompts: &[PromptPair],
     total_prompts: u32,
     tool_calls: u32,
@@ -349,7 +387,12 @@ fn print_session_summary(
         Some(t) if !t.is_empty() => format!("  {GREEN}{BOLD}{t}{RESET}"),
         _ => String::new(),
     };
-    println!("\n{CYAN}{BOLD}{session_id}{RESET}{title}  {DIM}{when}{RESET}{stats}");
+    let archived = if archived {
+        format!("  {DIM}[archived — cct unarchive {session_id} to resume]{RESET}")
+    } else {
+        String::new()
+    };
+    println!("\n{CYAN}{BOLD}{session_id}{RESET}{title}  {DIM}{when}{RESET}{stats}{archived}");
     println!("  {DIM}{}{RESET}", path.display());
     if prompts.is_empty() {
         println!("  {DIM}(no user prompts){RESET}");

@@ -384,8 +384,9 @@ sessions their own, shorter age (`off` makes them follow `--auto` again);
 `--headless-older-than 10d` does the same for a manual run, and on its own
 archives headless sessions only.
 
-Limitations: archived sessions don't appear in `cct recent` or the transfer
-picker, and `cct rename`/`cct transfer` skip them — unarchive first.
+`cct recent` lists archived sessions alongside live ones, marked
+`[archived]`. Limitations: they don't appear in the transfer picker, and
+`cct rename`/`cct transfer` skip them — unarchive first.
 
 ## Session retention
 
